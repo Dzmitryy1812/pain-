@@ -1,15 +1,13 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
 import requests
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+import math
+import pandas as pd
+from datetime import datetime
 
-# --- 1. КОНФИГУРАЦИЯ ---
-st.set_page_config(page_title="BTC Pro Analytics", layout="wide")
+# --- КОНФИГУРАЦИЯ ---
+st.set_page_config(page_title="Entry Calculator", layout="wide")
 
-# --- 2. ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ ---
-@st.cache_data(ttl=60)
+# --- ФУНКЦИИ ---
 def get_btc_price():
     try:
         url = "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd"
@@ -17,134 +15,90 @@ def get_btc_price():
         return float(res['result']['index_price'])
     except: return 0.0
 
-@st.cache_data(ttl=300)
-def get_deribit_data():
-    try:
-        url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
-        res = requests.get(url, timeout=15).json()
-        rows = []
-        for x in res.get('result', []):
-            parts = x['instrument_name'].split('-')
-            if len(parts) >= 4:
-                rows.append({
-                    'exp': parts[1], 
-                    'strike': float(parts[2]), 
-                    'type': parts[3], 
-                    'oi': float(x.get('open_interest', 0))
-                })
-        return pd.DataFrame(rows)
-    except: return pd.DataFrame()
+# --- ИНТЕРФЕЙС ---
+st.title("🧮 Калькулятор входа и Волатильности")
+st.write("Используйте этот инструмент для проверки математического преимущества перед входом в сделку на Polymarket.")
 
-def calc_gamma(S, K, iv, T):
-    if S <= 0 or K <= 0 or iv <= 0 or T <= 0: return 0.0
-    d1 = (np.log(S/K) + (0.5 * iv**2) * T) / (iv * np.sqrt(T))
-    return float(np.exp(-0.5 * d1**2) / (S * iv * np.sqrt(2 * np.pi * T)))
-
-# --- 3. БОКОВАЯ ПАНЕЛЬ ---
-st.sidebar.header("⚙️ Настройки")
-iv_val = st.sidebar.slider("IV % (Волатильность)", 10, 150, 60) / 100
-strike_range_pct = st.sidebar.slider("Масштаб графика %", 5, 50, 20)
-
-st.sidebar.divider()
-st.sidebar.header("🎯 Позиции Polymarket")
-p_low = st.sidebar.number_input("НИЗ (YES уровень)", value=68000)
-p_high = st.sidebar.number_input("ВЕРХ (NO уровень)", value=76000)
-
-if st.sidebar.button("🔄 Обновить данные"):
-    st.cache_data.clear()
-    st.rerun()
-
-# --- 4. ОСНОВНАЯ ЛОГИКА ---
 price = get_btc_price()
-df = get_deribit_data()
 
-if price > 0 and not df.empty:
-    expiries = sorted(df['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
-    sel_exp = st.selectbox("📅 Выберите дату экспирации:", expiries)
+# --- ВВОДНЫЕ ДАННЫЕ В КОЛОНКАХ ---
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.subheader("📊 Рыночные данные")
+    current_price = st.number_input("Текущая цена BTC ($)", value=price if price > 0 else 65000.0)
+    iv = st.slider("Подразумеваемая волатильность (IV %)", 10, 150, 60, help="Возьмите значение IV из основной вкладки мониторинга")
+
+with col2:
+    st.subheader("🎯 Ваша сделка")
+    p_high = st.number_input("Верхний барьер (NO)", value=76000)
+    p_low = st.number_input("Нижний барьер (YES)", value=68000)
+    days = st.slider("Дней до экспирации", 1, 30, 7)
+
+with col3:
+    st.subheader("💰 Polymarket")
+    entry_price = st.slider("Цена ставки (Binary Price)", 0.01, 0.99, 0.85, step=0.01)
+    bet_amount = st.number_input("Сумма входа ($)", value=100)
+
+# --- МАТЕМАТИЧЕСКИЙ РАСЧЕТ ---
+st.divider()
+st.subheader("📐 Расчет ожидаемого диапазона (Expected Move)")
+
+# Формула: EM = Price * IV * sqrt(T)
+t_years = days / 365
+sigma_1_pct = (iv / 100) * math.sqrt(t_years)
+sigma_1_move = current_price * sigma_1_pct
+
+# Границы уровней
+low_68 = current_price - sigma_1_move
+high_68 = current_price + sigma_1_move
+low_95 = current_price - (sigma_1_move * 2)
+high_95 = current_price + (sigma_1_move * 2)
+
+res_col1, res_col2 = st.columns(2)
+
+with res_col1:
+    st.write("### 68% Вероятности (1 Сигма)")
+    st.info(f"Диапазон: **${low_68:,.0f} — ${high_68:,.0f}**")
     
-    exp_date = datetime.strptime(sel_exp, "%d%b%y") + timedelta(hours=8)
-    hours_left = (exp_date - datetime.utcnow()).total_seconds() / 3600
-    T_years = max(hours_left / (24 * 365), 0.0001)
-
-    df_f = df[df['exp'] == sel_exp].copy()
-    min_s, max_s = price * (1 - strike_range_pct/100), price * (1 + strike_range_pct/100)
-    strikes = np.sort(df_f['strike'].unique())
-    strikes = strikes[(strikes >= min_s) & (strikes <= max_s)]
-
-    pains, gex_vals = [], []
-    for s in strikes:
-        c, p = df_f[df_f['type'] == 'C'], df_f[df_f['type'] == 'P']
-        pains.append(np.sum(np.maximum(0, s - c['strike']) * c['oi']) + np.sum(np.maximum(0, p['strike'] - s) * p['oi']))
-        net_oi = df_f[(df_f['strike'] == s) & (df_f['type']=='C')]['oi'].sum() - df_f[(df_f['strike'] == s) & (df_f['type']=='P')]['oi'].sum()
-        gex_vals.append(net_oi * calc_gamma(price, s, iv_val, T_years) * (price**2) * 0.01)
-
-    max_pain = float(strikes[np.argmin(pains)])
-
-    # --- ИНТЕРФЕЙС ГРАФИКИ ---
-    st.markdown(f"### 📈 Мониторинг рынка | Экспирация: {sel_exp}")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("ЦЕНА BTC", f"${price:,.1f}")
-    m2.metric("MAX PAIN (Магнит)", f"${max_pain:,.0f}")
-    m3.metric("До Max Pain %", f"{((max_pain/price - 1)*100):.1f}%")
-    m4.metric("До закрытия", f"{hours_left/24:.1f} дн.")
-
-    def add_layout_lines(fig):
-        fig.add_vline(x=price, line_width=4, line_color="#000000", 
-                      annotation_text=f" ЦЕНА: {price:,.0f}", 
-                      annotation_font_color="#FFFFFF", annotation_bgcolor="#000000")
-        fig.add_vline(x=p_low, line_dash="dash", line_width=2, line_color="#00FFFF", annotation_text=" YES")
-        fig.add_vline(x=p_high, line_dash="dash", line_width=2, line_color="#FF4500", annotation_text=" NO")
-
-    fig_gex = go.Figure()
-    fig_gex.add_trace(go.Bar(x=strikes, y=gex_vals, marker_color=['#00FF00' if x > 0 else '#FF0000' for x in gex_vals]))
-    add_layout_lines(fig_gex)
-    fig_gex.update_layout(title="ПРОФИЛЬ ГАММЫ (GEX)", template="plotly_dark", height=400)
-    st.plotly_chart(fig_gex, use_container_width=True)
-
-    fig_pain = go.Figure()
-    fig_pain.add_trace(go.Scatter(x=strikes, y=pains, fill='tozeroy', line_color='#E066FF'))
-    add_layout_lines(fig_pain)
-    fig_pain.add_vline(x=max_pain, line_dash="dot", line_color="#FFFFFF", annotation_text=" MAX PAIN")
-    fig_pain.update_layout(title="MAX PAIN HEATMAP", template="plotly_dark", height=350)
-    st.plotly_chart(fig_pain, use_container_width=True)
-
-    # --- БЛОК АВТО-РАСШИФРОВКИ ---
-    st.divider()
-    st.subheader("🧠 Вердикт для Polymarket")
-    col_a, col_b, col_c = st.columns(3)
-    
-    with col_a:
-        st.write("**🧲 Магнит (Max Pain):**")
-        if abs(price - max_pain) < 500: st.success("Цена на точке комфорта биржи.")
-        elif price > max_pain: st.info(f"Давление вниз к ${max_pain:,.0f}")
-        else: st.info(f"Давление вверх к ${max_pain:,.0f}")
-
-    with col_b:
-        st.write("**📊 Устойчивость (GEX):**")
-        idx = (np.abs(strikes - price)).argmin()
-        if gex_vals[idx] > 0: st.success("Рынок стабилен (Позитивная Гамма)")
-        else: st.error("Турбулентность (Негативная Гамма)!")
-
-    with col_c:
-        st.write("**⏳ Скорость прибыли (Theta):**")
-        if hours_left > 120:
-            st.write("🟢 **Стабильность.** Распад медленный.")
-        elif 72 < hours_left <= 120:
-            st.info("🟡 **Ускорение.** Время начинает работать.")
-        elif 24 < hours_left <= 72:
-            st.warning("🟠 **ЗОЛОТОЕ ОКНО.** Тета-распад стремительный.")
-        elif 12 < hours_left <= 24:
-            st.error("🔴 **МАКСИМУМ.** Прибыль капает каждый час.")
-        else:
-            st.error("🚨 **ФИНАЛ.** Максимальный риск волатильности!")
-
-    st.info("💡 **СОВЕТ:**")
-    if price < (p_high * 0.98) and gex_vals[idx] > 0:
-        st.write(f"✅ Позиция NO {p_high} в безопасности. Рынок на вашей стороне.")
-    elif price >= (p_high * 0.98):
-        st.error(f"🚨 ОПАСНО! Цена слишком близко к {p_high}. Возможен пробой!")
+    # Проверка барьера NO 76k
+    if p_high > high_68:
+        st.success(f"✅ Уровень {p_high} ВНЕ зоны риска 1 Сигмы. (Запас: ${p_high - high_68:,.0f})")
     else:
-        st.write("🧐 Ситуация нейтральная, следите за волатильностью.")
+        st.error(f"⚠️ Уровень {p_high} ВНУТРИ зоны 68%. Высокий риск пробития!")
 
+with res_col2:
+    st.write("### 95% Вероятности (2 Сигмы)")
+    st.info(f"Диапазон: **${low_95:,.0f} — ${high_95:,.0f}**")
+    
+    if p_high > high_95: 
+        st.success(f"💎 Уровень {p_high} ВНЕ зоны 2 Сигм. Математически это очень безопасная сделка.")
+    else:
+        st.warning(f"🧐 Уровень {p_high} находится в зоне экстремального выброса (95%).")
+
+# --- КАЛЬКУЛЯТОР ВЫГОДЫ ---
+st.divider()
+st.subheader("💵 Анализ прибыли")
+
+potential_win = (bet_amount / entry_price) - bet_amount
+roi = (potential_win / bet_amount) * 100
+annualized_roi = (roi / days) * 365
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Чистая прибыль", f"${potential_win:,.2f}")
+c2.metric("ROI за сделку", f"{roi:.1f}%")
+c3.metric("Годовых (APR)", f"{annualized_roi:.0f}%")
+
+# --- СОВЕТ ПО ВХОДУ ---
+st.divider()
+st.subheader("💡 Вердикт по входу:")
+
+# Простая логика оценки ценности (Arbitrage logic)
+# Если цена 0.85, значит рынок дает 85% успеха. 
+# Если наш расчет 1 сигмы (68%) показывает, что уровень далеко, значит реальный шанс успеха > 90%.
+if entry_price <= 0.85 and p_high > high_68:
+    st.success("🎯 ХОРОШИЙ ВХОД: Рынок переоценивает риск. Вы покупаете страховку дешево.")
+elif entry_price > 0.92:
+    st.warning("🤏 МАЛО ПРИБЫЛИ: Слишком высокая цена входа. Риск не стоит 8% прибыли.")
 else:
-    st.warning("Ожидание данных от API...")
+    st.info("⚖️ НЕЙТРАЛЬНО: Цена Polymarket соответствует рыночной волатильности.")
