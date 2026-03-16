@@ -9,168 +9,128 @@ from datetime import datetime, timezone
 from scipy.stats import norm
 
 # --- 1. CONFIG ---
-st.set_page_config(page_title="BTC Alpha Terminal v3.3", layout="wide")
+st.set_page_config(page_title="BTC Alpha Terminal v3.4", layout="wide")
 
-# --- 2. API FUNCTIONS ---
+# --- 2. DATA SOURCE ---
 @st.cache_data(ttl=60)
-def get_live_price():
+def get_data():
     try:
-        res = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", timeout=5).json()
-        return float(res['result']['index_price'])
-    except: return 70000.0
-
-@st.cache_data(ttl=300)
-def get_live_dvol():
-    try:
-        res = requests.get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1", timeout=5).json()
-        return float(res['result']['data'][-1][3])
-    except: return 55.0
-
-@st.cache_data(ttl=300)
-def get_options_data():
-    try:
-        res = requests.get("https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option", timeout=10).json()
+        # Индекс цены
+        p_res = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd").json()
+        price = float(p_res['result']['index_price'])
+        # Опционы (Book Summary)
+        o_res = requests.get("https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option").json()
         rows = []
-        for x in res['result']:
-            parts = x['instrument_name'].split('-')
-            if len(parts) >= 4:
-                rows.append({
-                    'exp': parts[1], 
-                    'strike': float(parts[2]), 
-                    'type': parts[3], 
-                    'oi': float(x.get('open_interest', 0)),
-                    'iv': float(x.get('mark_iv', 0))
-                })
-        return pd.DataFrame(rows)
-    except: return pd.DataFrame()
+        for x in o_res['result']:
+            p = x['instrument_name'].split('-')
+            if len(p) >= 4:
+                rows.append({'exp': p[1], 'strike': float(p[2]), 'type': p[3], 'oi': float(x.get('open_interest', 0)), 'iv': float(x.get('mark_iv', 0))})
+        return price, pd.DataFrame(rows)
+    except Exception as e:
+        st.error(f"Ошибка API: {e}")
+        return 70000.0, pd.DataFrame()
 
-# --- 3. MATH ENGINE ---
-def calculate_max_pain(df):
-    if df.empty: return None, [], []
+# --- 3. MATH ---
+def get_max_pain(df):
     strikes = sorted(df['strike'].unique())
-    calls = df[df['type'] == 'C'].groupby('strike')['oi'].sum()
-    puts = df[df['type'] == 'P'].groupby('strike')['oi'].sum()
-    total_pains = []
-    for s in strikes:
-        call_loss = np.sum(np.maximum(0, s - calls.index) * calls.values)
-        put_loss = np.sum(np.maximum(0, puts.index - s) * puts.values)
-        total_pains.append(call_loss + put_loss)
-    max_pain_val = strikes[np.argmin(total_pains)]
-    return float(max_pain_val), strikes, total_pains
+    calls = df[df['type'] == 'C'].set_index('strike')['oi'].reindex(strikes, fill_value=0)
+    puts = df[df['type'] == 'P'].set_index('strike')['oi'].reindex(strikes, fill_value=0)
+    pains = [np.sum(np.maximum(0, s - calls.index) * calls.values) + np.sum(np.maximum(0, puts.index - s) * puts.values) for s in strikes]
+    return float(strikes[np.argmin(pains)]), strikes, pains
 
-# --- 4. SIDEBAR SETTINGS ---
+# --- 4. APP ---
+price_now, df_all = get_data()
+
+if df_all.empty:
+    st.warning("⚠️ Не удалось загрузить данные. Проверьте интернет или VPN.")
+    st.stop()
+
 with st.sidebar:
     st.title("⚙️ Настройки")
-    live_p = get_live_price()
-    live_v = get_live_dvol()
-    price_now = float(st.number_input("Цена BTC ($)", value=live_p))
-    dvol_now = float(st.number_input("IV (DVOL) %", value=live_v))
+    p_now = st.number_input("BTC Price", value=price_now)
+    p_low = st.number_input("Lower Barrier", value=p_now - 5000)
+    p_high = st.number_input("Upper Barrier", value=p_now + 5000)
+    poly_px = st.slider("Polymarket Price", 0.01, 0.99, 0.5)
     
-    st.divider()
-    p_low = float(st.number_input("Нижний барьер ($)", value=price_now - 5000))
-    p_high = float(st.number_input("Верхний барьер ($)", value=price_now + 5000))
-    poly_px = st.slider("Цена на Polymarket (0.01-0.99)", 0.01, 0.99, 0.50)
-    
-    bankroll = st.number_input("Депозит ($)", value=1000)
-    kelly_mult = st.select_slider("Риск (Kelly)", options=[0.1, 0.25, 0.5, 1.0], value=0.25)
+    exps = sorted(list(df_all['exp'].unique()), key=lambda x: datetime.strptime(x, "%d%b%y"))
+    sel_exp = st.selectbox("📅 Expiry", exps)
 
-# --- 5. DATA PROCESSING ---
-df_opt = get_options_data()
-prob, edge, suggested_bet = 0, 0, 0
-max_pain_val, strikes_p, values_p = None, [], []
-sel_exp, mean_ivs = "N/A", pd.Series(dtype=float)
-oi_heatmap_data = None
+# Фильтрация данных по экспирации
+df = df_all[df_all['exp'] == sel_exp].copy()
+max_pain_val, strikes_v, pains_v = get_max_pain(df)
+mean_ivs = df[df['iv'] > 0].groupby('strike')['iv'].mean().sort_index()
 
-if not df_opt.empty:
-    exps = sorted(list(set(df_opt['exp'])), key=lambda x: datetime.strptime(x, "%d%b%y"))
-    sel_exp = st.selectbox("📅 Выберите экспирацию для анализа:", exps)
-    df_f = df_opt[df_opt['exp'] == sel_exp].copy()
-    
-    # Расчет времени
-    exp_dt = datetime.strptime(sel_exp, "%d%b%y").replace(tzinfo=timezone.utc)
-    days = max((exp_dt - datetime.now(timezone.utc)).total_seconds() / 86400, 0.01)
-    
-    # Макс Пейн и IV Улыбка
-    max_pain_val, strikes_p, values_p = calculate_max_pain(df_f)
-    mean_ivs = df_f[df_f['iv'] > 0].groupby('strike')['iv'].mean().sort_index()
-    
-    # Данные для слоев OI (Heatmap внутри графика)
-    oi_heatmap_data = df_f.groupby('strike')['oi'].sum().reset_index()
-    # Нормализуем OI для прозрачности (от 0 до 1)
-    max_oi = oi_heatmap_data['oi'].max()
-    oi_heatmap_data['alpha'] = oi_heatmap_data['oi'] / max_oi if max_oi > 0 else 0
+# Расчет вероятности
+exp_dt = datetime.strptime(sel_exp, "%d%b%y").replace(tzinfo=timezone.utc)
+t_y = max((exp_dt - datetime.now(timezone.utc)).total_seconds() / 31536000, 0.001)
+iv_avg = mean_ivs.mean() / 100
+std = iv_avg * math.sqrt(t_y)
+prob = norm.cdf((math.log(p_high/p_now) + 0.5*std**2)/std) - norm.cdf((math.log(p_low/p_now) + 0.5*std**2)/std)
+edge = prob - poly_px
 
-    # Вероятность
-    iv_l = float(np.interp(p_low, mean_ivs.index, mean_ivs.values)) if not mean_ivs.empty else dvol_now
-    iv_h = float(np.interp(p_high, mean_ivs.index, mean_ivs.values)) if not mean_ivs.empty else dvol_now
-    t_y = days / 365
-    std_h, std_l = (iv_h/100)*math.sqrt(t_y), (iv_l/100)*math.sqrt(t_y)
-    prob = norm.cdf((math.log(p_high/price_now)+0.5*std_h**2)/std_h) - norm.cdf((math.log(p_low/price_now)+0.5*std_l**2)/std_l)
-    edge = prob - poly_px
-    suggested_bet = ((edge / ((1/poly_px)-1)) * bankroll * kelly_mult) if edge > 0 else 0
-
-# --- 6. DASHBOARD ---
-st.title("🛡️ BTC Alpha Terminal v3.3")
+# --- 5. UI ---
+st.title("🛡️ Unified Liquidity Terminal")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Win Prob", f"{prob*100:.1f}%")
 c2.metric("Edge", f"{edge*100:+.1f}%")
 c3.metric("Max Pain", f"${max_pain_val:,.0f}")
-c4.metric("Days", f"{days:.2f}d")
+c4.metric("Spot", f"${p_now:,.0f}")
 
-# --- 7. THE MASTER CHART ---
-if not df_opt.empty:
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+# --- 6. MASTER CHART ---
+fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # 1. ГРАДИЕНТ ЛИКВИДНОСТИ (Встроенная Теплокарта OI)
-    # Рисуем вертикальные полосы OI за основным графиком
-    for index, row in oi_heatmap_data.iterrows():
-        # Рисуем только в разумном диапазоне вокруг текущей цены
-        if price_now * 0.7 < row['strike'] < price_now * 1.3:
-            fig.add_vrect(
-                x0=row['strike'] - 100, x1=row['strike'] + 100,
-                fillcolor="orange", opacity=float(row['alpha']) * 0.4, # Интенсивность зависит от OI
-                line_width=0, layer="below"
-            )
+# 1. Ликвидность (Open Interest) как тепловая полоса внизу
+# Мы используем Bar chart с цветовой шкалой, чтобы это было видно четко
+oi_data = df.groupby('strike')['oi'].sum().reset_index()
+fig.add_trace(go.Bar(
+    x=oi_data['strike'], 
+    y=[max(pains_v)*0.05] * len(oi_data), # Постоянная высота в 5% от графика
+    marker=dict(color=oi_data['oi'], colorscale='Viridis', showscale=True, cbartitle="OI Volume"),
+    name="Liquidity Wall (OI)",
+    hoverinfo="x+marker_color",
+    opacity=0.8
+), secondary_y=False)
 
-    # 2. ЗОНА ПРОФИТА (Барьеры)
-    fig.add_vrect(
-        x0=p_low, x1=p_high, 
-        fillcolor="rgba(0, 255, 100, 0.1)", line_width=2, line_dash="dash",
-        line_color="rgba(0, 150, 0, 0.5)", annotation_text="POLLY ZONE", annotation_position="top left"
-    )
+# 2. Кривая Max Pain
+fig.add_trace(go.Scatter(
+    x=strikes_v, y=pains_v, name="MM Pain",
+    fill='tozeroy', fillcolor='rgba(99, 110, 250, 0.2)',
+    line=dict(color="#636EFA", width=3)
+), secondary_y=False)
 
-    # 3. MAX PAIN (Область выплат)
+# 3. IV Smile
+if not mean_ivs.empty:
     fig.add_trace(go.Scatter(
-        x=strikes_p, y=values_p, name="MM Pain (Payout)",
-        fill='tozeroy', fillcolor='rgba(99, 110, 250, 0.2)',
-        line=dict(color="rgba(99, 110, 250, 0.8)", width=3)
-    ), secondary_y=False)
+        x=mean_ivs.index, y=mean_ivs.values, name="IV Smile %",
+        line=dict(color="#EF553B", width=2, dash='dot')
+    ), secondary_y=True)
 
-    # 4. IV SMILE
-    if not mean_ivs.empty:
-        fig.add_trace(go.Scatter(
-            x=mean_ivs.index, y=mean_ivs.values, name="IV Smile %",
-            mode='lines', line=dict(color="#EF553B", width=2, dash='dot')
-        ), secondary_y=True)
+# 4. Зона барьеров (Polymarket)
+fig.add_vrect(
+    x0=p_low, x1=p_high, fillcolor="rgba(0, 255, 0, 0.1)", 
+    line_width=2, line_color="green", line_dash="dash",
+    annotation_text="TARGET ZONE"
+)
 
-    # 5. ИНДИКАТОРЫ ЦЕНЫ
-    fig.add_vline(x=price_now, line=dict(color="black", width=2), annotation_text="SPOT")
-    fig.add_vline(x=max_pain_val, line=dict(color="blue", width=2, dash="dot"), annotation_text="MAX PAIN")
+# 5. Линии цен
+fig.add_vline(x=p_now, line_color="black", line_width=2, annotation_text="SPOT")
+fig.add_vline(x=max_pain_val, line_dash="dot", line_color="blue", annotation_text="MAX PAIN")
 
-    # НАСТРОЙКИ ГРАФИКА
-    fig.update_layout(
-        title=f"Liquidity & Pain Analysis: {sel_exp}",
-        template="plotly_white", height=700,
-        hovermode="x unified",
-        xaxis=dict(range=[price_now * 0.8, price_now * 1.2], title="Strike Price"),
-        legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center")
-    )
-    fig.update_yaxes(title_text="Pain Level", secondary_y=False, showgrid=False)
-    fig.update_yaxes(title_text="Implied Volatility %", secondary_y=True, showgrid=False)
-    
-    st.plotly_chart(fig, use_container_width=True)
+fig.update_layout(
+    height=700, template="plotly_white",
+    title=f"BTC Liquidity Map | Expiry: {sel_exp}",
+    xaxis=dict(range=[p_now*0.8, p_now*1.2], title="Strike Price"),
+    hovermode="x unified",
+    legend=dict(orientation="h", y=1.1)
+)
 
-    # Текстовый блок для ИИ/Копирования
-    st.code(f"Strategy: BTC {sel_exp} | Range: {p_low}-{p_high} | Edge: {edge*100:.1f}% | Kelly: ${suggested_bet:.0f}", language="markdown")
+fig.update_yaxes(title_text="Pain Level", secondary_y=False)
+fig.update_yaxes(title_text="IV (%)", secondary_y=True)
+
+st.plotly_chart(fig, use_container_width=True)
+
+# Инструкция если "нету" данных
+if df.empty:
+    st.error("Данные для этой экспирации отсутствуют. Попробуйте выбрать другую дату.")
 else:
-    st.warning("Загрузка данных...")
+    st.success(f"Загружено {len(df)} опционных контрактов.")
