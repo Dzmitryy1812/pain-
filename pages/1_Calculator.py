@@ -37,9 +37,6 @@ def get_btc_price():
     except: return 0.0
 
 # --- 3. ИНТЕРФЕЙС ---
-st.title("🧮 Калькулятор: Волатильность + Max Pain")
-st.write("Комплексная проверка входа на Polymarket")
-
 price_now = get_btc_price()
 df_options = get_deribit_data()
 
