@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import math
 
-# --- КОНФИГУРАЦИЯ ---
+# --- 1. НАСТРОЙКА СТРАНИЦЫ ---
 st.set_page_config(page_title="Entry Calculator", layout="wide")
 
 def get_btc_price():
@@ -12,91 +12,96 @@ def get_btc_price():
         return float(res['result']['index_price'])
     except: return 0.0
 
-st.title("🧮 Калькулятор волатильности: ОБЕ НОГИ")
+# --- 2. ЗАГОЛОВОК ---
+st.title("🧮 Профессиональный калькулятор входа")
+st.write("Этот инструмент покажет, насколько ваши цели на Polymarket соответствуют математике рынка.")
 
-price = get_btc_price()
+price_now = get_btc_price()
 
-# --- ВВОДНЫЕ ДАННЫЕ ---
-col_in1, col_in2 = st.columns(2)
+# --- 3. ПАНЕЛЬ НАСТРОЕК (ВВОД ДАННЫХ) ---
+st.subheader("⚙️ Настройки параметров")
+col_in1, col_in2, col_in3 = st.columns(3)
 
 with col_in1:
-    st.subheader("📝 Рынок")
-    current_price = st.number_input("BTC Price ($)", value=price if price > 0 else 73400.0)
-    iv = st.slider("Волатильность (IV %)", 10, 150, 60)
-    days = st.slider("Дней до конца", 1, 30, 4)
+    st.write("**Рыночные данные**")
+    current_price = st.number_input("Текущая цена BTC ($)", value=price_now if price_now > 0 else 73400.0)
+    # Тот самый слайдер IV, который вы меняете в зависимости от ситуации
+    iv = st.slider("Волатильность (IV %)", 10, 150, 40, help="40% - спокойно (как прошлую неделю), 60%+ - ждем движений.")
+    days = st.slider("Дней до конца ставки", 1, 30, 4)
 
 with col_in2:
-    st.subheader("🎯 Твои Границы")
-    p_high = st.number_input("ВЕРХНИЙ барьер (NO)", value=76000)
-    p_low = st.number_input("НИЖНИЙ барьер (YES)", value=68000)
-    buy_price = st.slider("Цена токена (Polymarket)", 0.01, 0.99, 0.85)
+    st.write("**Ваши уровни**")
+    p_high = st.number_input("Верхний барьер (NO)", value=78000)
+    p_low = st.number_input("Нижний барьер (YES)", value=70000)
 
-# --- МАТЕМАТИКА ---
+with col_in3:
+    st.write("**Деньги**")
+    buy_price = st.slider("Цена покупки на Polymarket", 0.05, 0.99, 0.85)
+    bet_amount = st.number_input("Сумма ставки ($)", value=100)
+
+# --- 4. МАТЕМАТИКА РАСЧЕТОВ ---
 t_years = days / 365
+# Расчет на основе введенного IV (ожидание рынка)
 sigma_1_pct = (iv / 100) * math.sqrt(t_years)
 sigma_1_move = current_price * sigma_1_pct
-
-# Границы волатильности
 low_68 = current_price - sigma_1_move
 high_68 = current_price + sigma_1_move
-low_95 = current_price - (sigma_1_move * 2)
-high_95 = current_price + (sigma_1_move * 2)
 
+# Расчет на основе IV 35% (историческая спокойная норма)
+historical_iv = 35 / 100
+sigma_hist = historical_iv * math.sqrt(t_years)
+low_hist = current_price * (1 - sigma_hist)
+high_hist = current_price * (1 + sigma_hist)
+
+# --- 5. ВИЗУАЛИЗАЦИЯ РИСКОВ ---
 st.divider()
-
-# --- АНАЛИЗ ОБЕИХ НОГ ---
 st.subheader("📐 Анализ рисков по диапазонам")
+
 c1, c2 = st.columns(2)
 
 with c1:
-    st.markdown("### 🟦 68% Вероятности")
-    st.info(f"Зона: **${low_68:,.0f} — ${high_68:,.0f}**")
+    st.markdown(f"### 🟦 При IV {iv}% (Ваш прогноз)")
+    st.write(f"Диапазон: **${low_68:,.0f} — ${high_68:,.0f}**")
     
-    # Проверка ВЕРХНЕЙ ноги
+    # Проверка ВЕРХА
     if p_high > high_68:
-        st.success(f"✅ ВЕРХ ({p_high}) — Ок")
+        st.success(f"✅ ВЕРХ {p_high} — Безопасно")
     else:
-        st.error(f"🚨 ВЕРХ ({p_high}) — В ОПАСНОСТИ")
-        
-    # Проверка НИЖНЕЙ ноги
+        st.error(f"🚨 ВЕРХ {p_high} — В зоне риска!")
+
+    # Проверка НИЗА
     if p_low < low_68:
-        st.success(f"✅ НИЗ ({p_low}) — Ок")
+        st.success(f"✅ НИЗ {p_low} — Безопасно")
     else:
-        st.error(f"🚨 НИЗ ({p_low}) — В ОПАСНОСТИ")
+        st.error(f"🚨 НИЗ {p_low} — В зоне риска!")
 
 with c2:
-    st.markdown("### 🟪 95% Вероятности")
-    st.info(f"Зона: **${low_95:,.0f} — ${high_95:,.0f}**")
+    st.markdown("### 📜 При IV 35% (Тихая неделя)")
+    st.write(f"Диапазон: **${low_hist:,.0f} — ${high_hist:,.0f}**")
     
-    if p_high > high_95: st.success(f"💎 ВЕРХ — Суперосновательно")
-    else: st.warning(f"⚠️ ВЕРХ — Возможен пробой при дампе/пампе")
+    # Сверка ваших уровней с "тихой" нормой
+    if p_high > high_hist: st.write("✅ Верх выше нормы")
+    else: st.write("⚠️ Верх может зацепить")
     
-    if p_low < low_95: st.success(f"💎 НИЗ — Суперосновательно")
-    else: st.warning(f"⚠️ НИЗ — Возможен пробой при дампе/пампе")
+    if p_low < low_hist: st.write("✅ Низ ниже нормы")
+    else: st.write("⚠️ Низ может зацепить")
 
-# --- ИТОГОВЫЙ СИГНАЛ ---
+# --- 6. ИТОГОВЫЙ ВЕРДИКТ И ПРИБЫЛЬ ---
 st.divider()
-st.subheader("💵 Анализ сделки")
+st.subheader("💰 Математика прибыли")
 
-potential_profit = (100 / buy_price) - 100
-total_return = (potential_profit / 100) * 100
+potential_profit = (bet_amount / buy_price) - bet_amount
+total_return = (potential_profit / bet_amount) * 100
 daily_return = total_return / days
 
-# ЛОГИКА СИГНАЛА ДЛЯ ДВУХ НОГ
-is_high_safe = p_high > high_68
-is_low_safe = p_low < low_68
-
-if is_high_safe and is_low_safe:
-    st.success(f"🟢 СИГНАЛ: Коридор ${p_low} - ${p_high} математически защищен. Прибыль {daily_return:.2f}% в день.")
-elif not is_high_safe and not is_low_safe:
-    st.error("🔴 СИГНАЛ: ОБЕ ГРАНИЦЫ под ударом! Волатильность шире твоего коридора.")
-elif not is_high_safe:
-    st.error(f"🟠 ВНИМАНИЕ: Опасность СВЕРХУ. BTC может уйти выше {p_high}.")
-else:
-    st.error(f"🟠 ВНИМАНИЕ: Опасность СНИЗУ. BTC может упасть ниже {p_low}.")
-
-# Метрики доходности
 m1, m2, m3 = st.columns(3)
-m1.metric("Прибыль со $100", f"${potential_profit:,.2f}")
-m2.metric("ROI сделки", f"{total_return:.1f}%")
-m3.metric("ROI в день", f"{daily_return:.2f}%")
+m1.metric("Чистая прибыль", f"${potential_profit:,.2f}")
+m2.metric("ROI за сделку", f"{total_return:.1f}%")
+m3.metric("Прибыль в день", f"{daily_return:.2f}%")
+
+if p_high > high_68 and p_low < low_68:
+    st.success("🎯 ИДЕАЛЬНЫЙ ВХОД: Ваши уровни шире рыночной волатильности.")
+else:
+    st.warning("🧐 РИСКОВАННО: Математика считает, что цена может выйти за ваши уровни при текущем IV.")
+
+st.info(f"💡 **Совет:** Если прошлую неделю было тихо, и вы не ждете новостей, поставьте IV на 35-40%. Если ждете памп/дамп — ставьте 60-70%.")
