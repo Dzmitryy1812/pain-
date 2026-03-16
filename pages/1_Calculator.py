@@ -122,30 +122,58 @@ if not df_all.empty and sel_exp != "N/A":
             oi_density = (range_oi / total_oi * 100) if total_oi > 0 else 0
             st.info(f"В зоне сконцентрировано {oi_density:.1f}% ликвидности экспирации. Это создает опору для диапазона.")
 
-    # ГРАФИК
+   # ГРАФИК
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     oi_data = df.groupby('strike')['oi'].sum().reset_index()
     
-    # 1. Бар ликвидности
-    fig.add_trace(go.Bar(x=oi_data['strike'], y=[max(pains_v)*0.1]*len(oi_data), 
-                         name="Ликвидность (OI)", marker=dict(color=oi_data['oi'], colorscale='Viridis')), secondary_y=False)
+    # 1. Бар ликвидности - ТЕПЕРЬ ВЫСОТА ЗАВИСИТ ОТ ОБЪЕМА (OI)
+    fig.add_trace(go.Bar(
+        x=oi_data['strike'], 
+        y=oi_data['oi'], # Используем реальный объем для высоты
+        name="Ликвидность (OI)", 
+        marker=dict(
+            color=oi_data['oi'], 
+            colorscale='Viridis',
+            showscale=False # Отключаем шкалу справа, чтобы не загромождать
+        ),
+        opacity=0.6,
+        hovertemplate="Страйк: %{x}<br>OI: %{y:.0f} BTC<extra></extra>"
+    ), secondary_y=False)
+
     # 2. Кривая Pain
-    fig.add_trace(go.Scatter(x=strikes_v, y=pains_v, name="Линия Боли (MM Pain)", 
-                             fill='tozeroy', fillcolor='rgba(99, 110, 250, 0.1)', line=dict(width=3)), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=strikes_v, 
+        y=pains_v, 
+        name="Линия Боли (MM Pain)", 
+        fill='tozeroy', 
+        fillcolor='rgba(99, 110, 250, 0.1)', 
+        line=dict(width=3, color='royalblue')
+    ), secondary_y=True) # Перенесли Pain на secondary_y, чтобы шкалы OI и Pain не мешали друг другу
+
     # 3. IV Smile
     if not mean_ivs.empty:
-        fig.add_trace(go.Scatter(x=mean_ivs.index, y=mean_ivs.values, name="IV (Smile)", 
-                                 line=dict(color='red', dash='dot')), secondary_y=True)
+        fig.add_trace(go.Scatter(
+            x=mean_ivs.index, 
+            y=mean_ivs.values, 
+            name="IV (Smile)", 
+            line=dict(color='red', dash='dot')
+        ), secondary_y=True)
 
     # Оформление
     fig.add_vrect(x0=p_low, x1=p_high, fillcolor="rgba(0, 255, 0, 0.05)", line=dict(color="green", dash="dash"), 
                   annotation_text="ВАШ ДИАПАЗОН", annotation_position="top left")
+    
     fig.add_vline(x=calc_price, line_color="black", line_width=2, annotation_text="SPOT")
-    fig.add_vline(x=max_pain_val, line_color="blue", line_dash="dot", annotation_text="MAX PAIN")
+    fig.add_vline(x=max_pain_val, line_color="orange", line_dash="dot", annotation_text="MAX PAIN")
 
-    fig.update_layout(height=650, template="plotly_white", xaxis=dict(range=[calc_price*0.75, calc_price*1.25], title="Цена BTC ($)"),
-                      legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"), hovermode="x unified")
+    fig.update_layout(
+        height=650, 
+        template="plotly_white", 
+        xaxis=dict(range=[calc_price*0.8, calc_price*1.2], title="Цена BTC ($)"),
+        yaxis=dict(title="Open Interest (BTC)"),
+        yaxis2=dict(title="MM Pain / IV %", overlaying='y', side='right'),
+        legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center"), 
+        hovermode="x unified"
+    )
     
     st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("📊 Ожидание данных от Deribit...")
