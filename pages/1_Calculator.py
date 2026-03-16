@@ -190,3 +190,34 @@ if not df_options.empty:
 
 else:
     st.error("Не удалось загрузить данные из API. Проверьте соединение.")
+
+# --- 10. ADVANCED RISK MANAGEMENT ---
+    st.divider()
+    st.subheader("📊 Профессиональный Риск-Менеджмент")
+    
+    col_kelly, col_touch = st.columns(2)
+    
+    with col_kelly:
+        # Критерий Келли: f = (bp - q) / b
+        # b = коэффициент прибыли (чистая прибыль / ставка)
+        b_kelly = profit / bet_amount if bet_amount > 0 else 1
+        p_kelly = prob_success
+        q_kelly = 1 - p_kelly
+        kelly_f = (b_kelly * p_kelly - q_kelly) / b_kelly if b_kelly > 0 else 0
+        
+        st.write("**💰 Оптимальный размер позиции (Келли):**")
+        if kelly_f > 0:
+            st.info(f"Рекомендуется ставить **{kelly_f*100:.1f}%** от вашего банка.")
+        else:
+            st.error("Система рекомендует: **0%** (Отрицательное ожидание).")
+        st.caption("Келли помогает не обанкротиться при серии неудач.")
+
+    with col_touch:
+        # Вероятность касания (приблизительно 2 * Prob_out)
+        prob_out = 1 - prob_success
+        prob_touch = min(prob_out * 2, 1.0)
+        
+        st.write("**⚠️ Шанс временного касания (Touch):**")
+        color_touch = "red" if prob_touch > 0.3 else "orange" if prob_touch > 0.15 else "green"
+        st.markdown(f":{color_touch}[**{prob_touch*100:.1f}%**]")
+        st.caption("Шанс того, что цена заденет ваш барьер хотя бы на секунду.")
