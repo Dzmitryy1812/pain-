@@ -1,3 +1,6 @@
-yfinance
+streamlit
 pandas
 numpy
+requests
+scipy
+plotly
