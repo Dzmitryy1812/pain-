@@ -19,13 +19,21 @@ def get_btc_price():
         return float(res['result']['index_price'])
     except: return 73500.0
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=30) # Данные будут обновляться каждые 30 секунд
 def get_live_dvol():
     try:
-        url = "https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1&start_timestamp="
-        res = requests.get(url, timeout=10).json()
-        return float(res['result']['data'][-1][1])
-    except: return 50.0
+        # Запрашиваем последние данные 1-минутных свечей DVOL
+        url = "https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1"
+        res = requests.get(url, timeout=5).json()
+        
+        # Берем самый свежий результат (последняя свеча, цена закрытия)
+        if 'result' in res and 'data' in res['result']:
+            current_dvol = res['result']['data'][-1][3] # [timestamp, open, high, low, close] -> берем close
+            return float(current_dvol)
+        else:
+            return 52.6 # Если API ответил, но данных нет, обновим дефолт на актуальный
+    except Exception as e:
+        return 52.6 # Если API вообще не ответил
 
 @st.cache_data(ttl=300)
 def get_options_chain():
