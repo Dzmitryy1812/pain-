@@ -2,102 +2,104 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
-#from scipy.stats import norm
 import plotly.graph_objects as go
 
-# Настройка страницы
-st.set_page_config(page_title="BTC Max Pain & GEX Professional", layout="wide")
+# 1. ПЕРВАЯ КОМАНДА (обязательно в самом начале)
+st.set_page_config(page_title="BTC Max Pain & GEX", layout="wide")
 
-# --- КОНСТАНТЫ И API ---
-HEADERS = {'User-Agent': 'Mozilla/5.0'}
-
+# --- ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ ---
 @st.cache_data(ttl=60)
 def get_btc_price():
     try:
         url = "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd"
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        return float(response.json()['result']['index_price'])
-    except Exception:
+        res = requests.get(url, timeout=10).json()
+        return float(res['result']['index_price'])
+    except:
         return 0.0
 
 @st.cache_data(ttl=300)
-def get_deribit_data(currency="BTC"):
+def get_deribit_data():
     try:
-        url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={currency}&kind=option"
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        data = response.json()
-        
-        if 'result' not in data:
-            return pd.DataFrame()
-            
+        url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
+        res = requests.get(url, timeout=15).json()
         rows = []
-        for item in data['result']:
-            name = item['instrument_name'] 
-            parts = name.split('-')
-            if len(parts) >= 4:
-                rows.append({
-                    'expiry': parts[1],
-                    'strike': float(parts[2]),
-                    'type': parts[3],
-                    'oi': float(item.get('open_interest', 0))
-                })
+        for x in res.get('result', []):
+            p = x['instrument_name'].split('-')
+            if len(p) >= 4:
+                rows.append({'exp': p[1], 'strike': float(p[2]), 'type': p[3], 'oi': float(x.get('open_interest', 0))})
         return pd.DataFrame(rows)
-    except Exception:
+    except:
         return pd.DataFrame()
 
-# --- МАТЕМАТИКА (Greeks & Pain) ---
-def calculate_gamma(S, K, T_days, sigma):
-    T = T_days / 365.0
-    if T <= 0 or sigma <= 0 or S <= 0:
-        return 0.0
-    d1 = (np.log(S/K) + (0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    gamma = np.exp(-0.5 * d1**2) / (S * sigma * np.sqrt(2 * np.pi * T))
-    return gamma
+# --- МАТЕМАТИКА ---
+def calc_gamma(S, K, iv):
+    T = 7/365.0 # Среднее время до экспирации
+    if S <= 0 or K <= 0 or iv <= 0: return 0
+    d1 = (np.log(S/K) + (0.5 * iv**2) * T) / (iv * np.sqrt(T))
+    return np.exp(-0.5 * d1**2) / (S * iv * np.sqrt(2 * np.pi * T))
 
-def process_metrics(df, spot_price, iv_val, range_pct):
-    if df.empty or spot_price <= 0:
-        return None
-    
-    # 1. Фильтрация страйков вокруг цены (как в Pine Script)
-    min_strike = spot_price * (1 - range_pct/100)
-    max_strike = spot_price * (1 + range_pct/100)
-    
-    unique_strikes = np.sort(df['strike'].unique())
-    unique_strikes = unique_strikes[(unique_strikes >= min_strike) & (unique_strikes <= max_strike)]
-    
-    if len(unique_strikes) == 0:
-        return None
+# --- ИНТЕРФЕЙС ---
+st.title("🎯 BTC Options Analysis")
 
+# Сайдбар для настроек
+st.sidebar.header("Настройки")
+iv_val = st.sidebar.slider("IV %", 10, 150, 60) / 100
+strike_range = st.sidebar.slider("Диапазон цен %", 5, 50, 20)
+
+price = get_btc_price()
+df = get_deribit_data()
+
+if price > 0 and not df.empty:
+    # Выбор даты
+    expiries = sorted(df['exp'].unique())
+    sel_exp = st.selectbox("Срок экспирации", expiries)
+    
+    # Фильтрация данных
+    df_f = df[df['exp'] == sel_exp].copy()
+    
+    # Расчет метрик по страйкам
+    min_s, max_s = price * (1-strike_range/100), price * (1+strike_range/100)
+    strikes = np.sort(df_f['strike'].unique())
+    strikes = strikes[(strikes >= min_s) & (strikes <= max_s)]
+    
     pains = []
-    gex_list = []
+    gex_vals = []
     
-    # Расчет для каждого страйка
-    for test_s in unique_strikes:
-        # Логика Max Pain (Intrinsic Value Loss)
-        calls = df[df['type'] == 'C']
-        puts = df[df['type'] == 'P']
+    for s in strikes:
+        # Max Pain logic
+        c = df_f[df_f['type'] == 'C']
+        p = df_f[df_f['type'] == 'P']
+        pain = np.sum(np.maximum(0, s - c['strike']) * c['oi']) + np.sum(np.maximum(0, p['strike'] - s) * p['oi'])
+        pains.append(float(pain))
         
-        c_loss = np.sum(np.maximum(0, test_s - calls['strike']) * calls['oi'])
-        p_loss = np.sum(np.maximum(0, puts['strike'] - test_s) * puts['oi'])
-        pains.append(float(c_loss + p_loss))
+        # GEX logic
+        stk_data = df_f[df_f['strike'] == s]
+        net_oi = stk_data[stk_data['type']=='C']['oi'].sum() - stk_data[stk_data['type']=='P']['oi'].sum()
+        gex = net_oi * calc_gamma(price, s, iv_val) * (price**2) * 0.01
+        gex_vals.append(float(gex))
+    
+    if len(strikes) > 0:
+        max_pain = strikes[np.argmin(pains)]
         
-        # Логика Gamma Exposure (GEX)
-        strike_data = df[df['strike'] == test_s]
-        c_oi = strike_data[strike_data['type'] == 'C']['oi'].sum()
-        p_oi = strike_data[strike_data['type'] == 'P']['oi'].sum()
-        
-        # Берем 7 дней до экспирации как среднее значение (из вашего скрипта)
-        gamma = calculate_gamma(spot_price, test_s, 7, iv_val)
-        # GEX = (Net OI) * Gamma * Spot^2 * 0.01
-        gex = (c_oi - p_oi) * gamma * (spot_price**2) * 0.01
-        gex_list.append(float(gex))
-        
-    return {
-        'strikes': unique_strikes,
-        'pains': np.array(pains),
-        'gex': np.array(gex_list),
-        'max_pain': float(unique_strikes[np.argmin(pains)])
-    }
+        # Виджеты
+        c1, c2, c3 = st.columns(3)
+        c1.metric("BTC Price", f"${price:,.1f}")
+        c2.metric("Max Pain", f"${max_pain:,.0f}")
+        c3.metric("Разница", f"{((max_pain/price-1)*100):.1f}%")
 
-# --- И
+        # Графики
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(x=strikes, y=gex_vals, marker_color=['green' if x>0 else 'red' for x in gex_vals]))
+        fig1.add_vline(x=price, line_dash="dash", line_color="yellow")
+        fig1.update_layout(title="Gamma Exposure Profile", template="plotly_dark", height=350)
+        st.plotly_chart(fig1, use_container_width=True)
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=strikes, y=pains, fill='tozeroy', line_color='cyan'))
+        fig2.add_vline(x=max_pain, line_color="orange", width=3)
+        fig2.update_layout(title="Pain Heatmap", template="plotly_dark", height=350)
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.warning("Нет активных страйков в этом диапазоне.")
+else:
+    st.info("Загрузка данных с Deribit...")
