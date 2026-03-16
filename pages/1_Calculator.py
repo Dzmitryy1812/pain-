@@ -3,10 +3,12 @@ import pandas as pd
 import numpy as np
 import requests
 import math
+import plotly.graph_objects as go
 from datetime import datetime
+from scipy.stats import norm
 
-# --- 1. КОНФИГУРАЦИЯ СТРАНИЦЫ ---
-st.set_page_config(page_title="Entry Calculator Pro", layout="wide")
+# --- 1. НАСТРОЙКИ СТРАНИЦЫ ---
+st.set_page_config(page_title="BTC Entry Pro Calculator", layout="wide")
 
 # --- 2. ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ ---
 @st.cache_data(ttl=300)
@@ -25,9 +27,7 @@ def get_deribit_data():
                     'oi': float(x.get('open_interest', 0))
                 })
         return pd.DataFrame(rows)
-    except Exception as e:
-        st.error(f"Ошибка API Deribit: {e}")
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def get_btc_price():
     try:
@@ -36,115 +36,161 @@ def get_btc_price():
         return float(res['result']['index_price'])
     except: return 0.0
 
-# --- 3. ИНТЕРФЕЙС ---
+# --- 3. ИНИЦИАЛИЗАЦИЯ ДАННЫХ ---
 price_now = get_btc_price()
 df_options = get_deribit_data()
 
-# --- 4. БЛОК НАСТРОЕК ---
-col_in1, col_in2, col_in3 = st.columns(3)
+st.title("🧮 Терминал оценки входа: Alpha Анализ")
+st.write(f"Последнее обновление цены: **${price_now:,.2f}**")
 
-with col_in1:
-    st.subheader("⚙️ Рыночные данные")
-    current_price = st.number_input("Текущая цена BTC ($)", value=price_now if price_now > 0 else 73400.0)
-    # Слайдер для волатильности
-    iv = st.slider("Волатильность (IV %)", 10, 150, 40, help="Чем выше IV, тем шире диапазон риска.")
-    
-    if not df_options.empty:
-        expiries = sorted(df_options['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
-        sel_exp = st.selectbox("📅 Дата экспирации сделки:", expiries)
-    else:
-        sel_exp = None
-        st.warning("Не удалось загрузить даты из Deribit.")
-
-with col_in2:
-    st.subheader("🎯 Границы Polymarket")
-    p_high = st.number_input("Верхний барьер (NO)", value=78000)
-    p_low = st.number_input("Нижний барьер (YES)", value=70000)
-
-with col_in3:
-    st.subheader("💰 Деньги")
-    buy_price = st.slider("Цена токена (Polymarket)", 0.05, 0.99, 0.85)
+# --- 4. БОКОВАЯ ПАНЕЛЬ И ВВОД ДАННЫХ ---
+with st.sidebar:
+    st.header("📋 Параметры сделки")
+    p_high = st.number_input("Верхний барьер (NO)", value=78000, step=500)
+    p_low = st.number_input("Нижний барьер (YES)", value=70000, step=500)
+    st.divider()
+    polymarket_price = st.slider("Цена токена на Polymarket", 0.05, 0.99, 0.85, step=0.01)
     bet_amount = st.number_input("Сумма ставки ($)", value=100)
+    st.divider()
+    custom_iv = st.slider("Ручной IV % (Волатильность)", 10, 150, 45)
 
-# --- 5. ЛОГИКА РАСЧЕТОВ ---
-max_pain = 0
-days_left = 4
+col_main1, col_main2 = st.columns([2, 1])
 
-# Расчет Max Pain
-if sel_exp and not df_options.empty:
-    df_f = df_options[df_options['exp'] == sel_exp]
-    strikes = np.sort(df_f['strike'].unique())
-    pains = []
+# --- 5. РАСЧЕТЫ (ENGINE) ---
+if not df_options.empty:
+    expiries = sorted(df_options['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
     
-    # Считаем совокупную "боль" для каждого страйка
+    with col_main1:
+        sel_exp = st.selectbox("📅 Выберите дату экспирации (соответствующую рынку):", expiries)
+    
+    # Расчет Max Pain и PCR
+    df_f = df_options[df_options['exp'] == sel_exp].copy()
+    strikes = np.sort(df_f['strike'].unique())
+    
+    pains = []
     for s in strikes:
-        c = df_f[df_f['type'] == 'C']
-        p = df_f[df_f['type'] == 'P']
-        loss = np.sum(np.maximum(0, s - c['strike']) * c['oi']) + np.sum(np.maximum(0, p['strike'] - s) * p['oi'])
+        calls = df_f[df_f['type'] == 'C']
+        puts = df_f[df_f['type'] == 'P']
+        loss = np.sum(np.maximum(0, s - calls['strike']) * calls['oi']) + np.sum(np.maximum(0, puts['strike'] - s) * puts['oi'])
         pains.append(loss)
     
-    if len(pains) > 0:
-        max_pain = float(strikes[np.argmin(pains)])
+    max_pain = float(strikes[np.argmin(pains)])
     
-    # Считаем дни до экспирации
+    put_oi = df_f[df_f['type'] == 'P']['oi'].sum()
+    call_oi = df_f[df_f['type'] == 'C']['oi'].sum()
+    pcr = put_oi / call_oi if call_oi > 0 else 0
+    
+    # Расчет времени
     exp_dt = datetime.strptime(sel_exp, "%d%b%y")
-    days_left = max((exp_dt - datetime.utcnow()).days, 1)
+    days_to_expiry = max((exp_dt - datetime.utcnow()).days + (exp_dt - datetime.utcnow()).seconds/86400, 0.1)
+    t_years = days_to_expiry / 365
 
-# Математика волатильности (Expected Move)
-t_years = days_left / 365
-sigma_move = (iv / 100) * math.sqrt(t_years) * current_price
-low_68, high_68 = current_price - sigma_move, current_price + sigma_move
+    # Математическое ожидание движения (Expected Move)
+    # Используем формулу стандартного отклонения
+    stdev = (custom_iv / 100) * math.sqrt(t_years)
+    upper_1s = price_now * (1 + stdev)
+    lower_1s = price_now * (1 - stdev)
+    upper_2s = price_now * (1 + 2*stdev)
+    lower_2s = price_now * (1 - 2*stdev)
 
-# --- 6. ВИЗУАЛИЗАЦИЯ ---
-st.divider()
-row_res = st.columns(2)
-
-with row_res[0]:
-    st.subheader("📐 Риск волатильности (1σ)")
-    st.info(f"Диапазон 68%: **${low_68:,.0f} — ${high_68:,.0f}**")
+    # РАСЧЕТ МАТЕМАТИЧЕСКОГО ПРЕИМУЩЕСТВА (EDGE)
+    # Вероятность того, что цена НЕ дойдет до верхнего барьера (аналитическое приближение)
+    d2_upper = (math.log(p_high / price_now) - (0.5 * (custom_iv/100)**2) * t_years) / ((custom_iv/100) * math.sqrt(t_years))
+    prob_not_breach_upper = norm.cdf(d2_upper) 
     
-    # Проверка уровней
-    h_safe = p_high > high_68
-    l_safe = p_low < low_68
-    
-    if h_safe: st.success(f"✅ ВЕРХ {p_high} защищен")
-    else: st.error(f"🚨 ВЕРХ {p_high} ПОД УДАРОМ")
-    
-    if l_safe: st.success(f"✅ НИЗ {p_low} защищен")
-    else: st.error(f"🚨 НИЗ {p_low} ПОД УДАРОМ")
+    # Справедливая цена токена на основе мат. ожидания
+    fair_price = prob_not_breach_upper 
+    edge = fair_price - polymarket_price
 
-with row_res[1]:
-    st.subheader("🧲 Фактор Max Pain")
-    if max_pain > 0:
-        st.write(f"Точка 'Магнита': **${max_pain:,.0f}**")
-        # Проверка: внутри ли Max Pain нашего диапазона
-        if p_low < max_pain < p_high:
-            st.success("✅ Магнит внутри коридора (Безопасно)")
-        else:
-            st.warning("⚠️ Магнит ВНЕ коридора. Цену может утянуть.")
+    # --- 6. ВИЗУАЛИЗАЦИЯ И ДАШБОРД ---
+    
+    with col_main1:
+        # ГРАФИК КАРТЫ ПОЗИЦИИ
+        fig = go.Figure()
+        # Линия текущей цены
+        fig.add_vline(x=price_now, line_width=3, line_color="white", annotation_text="PRICE", annotation_position="top")
+        # Барьеры
+        fig.add_vrect(x0=p_low, x1=p_high, fillcolor="green", opacity=0.1, line_width=0, annotation_text="ВАША ЗОНА ПРИБЫЛИ")
+        fig.add_vline(x=p_low, line_dash="dash", line_color="cyan", annotation_text="YES Barrier")
+        fig.add_vline(x=p_high, line_dash="dash", line_color="orange", annotation_text="NO Barrier")
+        # Max Pain
+        fig.add_vline(x=max_pain, line_color="red", line_dash="dot", annotation_text="MAX PAIN (Магнит)")
         
-        dist_to_pain = ((max_pain / current_price) - 1) * 100
-        st.write(f"Давление рынка к текущей цене: **{dist_to_pain:+.1f}%**")
-    else:
-        st.write("Данные Max Pain не определены")
+        fig.update_layout(title="Карта рисков и Магнитов рынка", template="plotly_dark", height=300, 
+                          xaxis=dict(range=[min(p_low, lower_2s)*0.98, max(p_high, upper_2s)*1.02]))
+        st.plotly_chart(fig, use_container_width=True)
 
-# --- 7. ИТОГОВЫЙ ВЕРДИКТ ---
-st.divider()
-profit = (bet_amount / buy_price) - bet_amount
-total_roi = (profit / bet_amount) * 100
-daily_roi = total_roi / days_left
+        # Метрики прибыли
+        c_p1, c_p2, c_p3, c_p4 = st.columns(4)
+        profit_raw = (bet_amount / polymarket_price) - bet_amount
+        c_p1.metric("Прибыль $", f"${profit_raw:,.1f}")
+        c_p2.metric("ROI", f"{(profit_raw/bet_amount*100):.1f}%")
+        c_p3.metric("Вероятность (Math)", f"{(fair_price*100):.1f}%")
+        
+        edge_color = "normal" if edge < 0 else "inverse"
+        c_p4.metric("Мат. Преимущество", f"{edge*100:+.1f}%", delta_color=edge_color)
 
-st.subheader("💡 Анализ входа")
-col_final1, col_final2 = st.columns([2, 1])
+    with col_main2:
+        st.subheader("🕵️ Сентимент")
+        st.write(f"**PCR Ratio:** `{pcr:.2f}`")
+        if pcr > 1.1: st.warning("🐻 Рынок страхуется от падения (много Путов)")
+        elif pcr < 0.7: st.success("🐂 Рынок уверен в росте (много Коллов)")
+        else: st.info("⚖️ Нейтральный баланс сил")
+        
+        st.divider()
+        st.subheader("📐 Зоны риска (IV)")
+        st.write(f"1σ (68%): `${lower_1s:,.0f} - ${upper_1s:,.0f}`")
+        st.write(f"2σ (95%): `${lower_2s:,.0f} - ${upper_2s:,.0f}`")
+        
+        dist_to_pain = (max_pain / price_now - 1) * 100
+        st.write(f"**Тяга к Max Pain:** `{dist_to_pain:+.1f}%`")
 
-with col_final1:
-    if h_safe and l_safe and (p_low < max_pain < p_high):
-        st.success(f"🟢 СТРАТЕГИЯ: ОТЛИЧНО. Ваши границы шире движений рынка, а Max Pain тянет цену в центр.")
-    elif h_safe and l_safe:
-        st.info("🟡 СТРАТЕГИЯ: УДОВЛЕТВОРИТЕЛЬНО. Волатильность не пробивает уровни, но Max Pain тянет цену к одной из границ.")
-    else:
-        st.error("🔴 СТРАТЕГИЯ: ОПАСНО. Математика прогнозирует выход за ваши уровни.")
+    # --- 7. ФИНАЛЬНЫЙ ВЕРДИКТ ---
+    st.divider()
+    st.subheader("💡 Итоговое заключение по позиции:")
+    
+    verdict_col1, verdict_col2 = st.columns([3, 1])
+    
+    with verdict_col1:
+        score = 0
+        reasons = []
+        
+        # Проверка IV барьеров
+        if p_high > upper_1s: 
+            score += 1
+            reasons.append("✅ Верхний барьер вне зоны основной волатильности (1 сигма).")
+        else:
+            reasons.append("🚨 ОПАСНО: Верхний барьер может быть легко достигнут при текущем IV.")
+            
+        if p_low < lower_1s:
+            score += 1
+            reasons.append("✅ Нижний барьер в зоне относительной безопасности.")
+        
+        # Проверка Max Pain
+        if p_low < max_pain < p_high:
+            score += 1
+            reasons.append(f"✅ Max Pain (${max_pain:,.0f}) находится внутри вашего коридора. Это будет удерживать цену.")
+        
+        # Проверка Edge
+        if edge > 0.05:
+            score += 1
+            reasons.append(f"✅ Цена на Polymarket ({polymarket_price}) ниже математической вероятности ({fair_price:.2f}). Это выгодная ставка.")
+        elif edge < -0.05:
+            reasons.append(f"❌ Переплата: Вы покупаете риск слишком дорого. Математика дает меньший шанс успеха.")
 
-with col_final2:
-    st.metric("ROI в день", f"{daily_roi:.2f}%")
-    st.metric("Чистая прибыль", f"${profit:,.1f}")
+        for r in reasons:
+            st.write(r)
+
+    with verdict_col2:
+        if score >= 3:
+            st.success("💎 СДЕЛКА: КЛАСС А")
+            st.write("Высокое мат. преимущество.")
+        elif score == 2:
+            st.warning("⚠️ СДЕЛКА: КЛАСС B")
+            st.write("Есть риски, но профит оправдан.")
+        else:
+            st.error("🚫 СДЕЛКА: КЛАСС C")
+            st.write("Математика против этой позиции.")
+
+else:
+    st.error("Не удалось получить данные от API. Пожалуйста, попробуйте позже.")
