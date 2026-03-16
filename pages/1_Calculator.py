@@ -8,160 +8,149 @@ from datetime import datetime, timezone
 from scipy.stats import norm
 
 # --- 1. НАСТРОЙКИ ---
-st.set_page_config(page_title="BTC Polymarket Alpha", layout="wide")
+st.set_page_config(page_title="BTC Alpha Terminal Pro", layout="wide")
 
-# --- 2. УЛУЧШЕННЫЙ ЗАХВАТ ДАННЫХ ---
+# --- 2. УМНЫЙ ЗАХВАТ ДАННЫХ ---
 @st.cache_data(ttl=60)
 def get_market_data():
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    data = {"price": None, "dvol": None, "options": pd.DataFrame()}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    results = {"price": None, "dvol": None, "options": pd.DataFrame(), "error": None}
+    
     try:
-        # Цена
-        p_res = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", timeout=5).json()
-        data["price"] = float(p_res['result']['index_price'])
-        # DVOL
-        v_res = requests.get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1", timeout=5).json()
-        data["dvol"] = float(v_res['result']['data'][-1][3])
-        # Опционы
-        o_res = requests.get("https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option", timeout=10).json()
-        rows = []
-        for x in o_res['result']:
-            parts = x['instrument_name'].split('-')
-            rows.append({'exp': parts[1], 'strike': float(parts[2]), 'type': parts[3], 'oi': float(x.get('open_interest', 0))})
-        data["options"] = pd.DataFrame(rows)
-    except: pass
-    return data
+        # 1. Цена
+        p_res = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", timeout=10).json()
+        results["price"] = float(p_res['result']['index_price'])
+        
+        # 2. Волатильность
+        v_res = requests.get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1", timeout=10).json()
+        results["dvol"] = float(v_res['result']['data'][-1][3])
+        
+        # 3. Опционы (Тяжелый запрос)
+        o_res = requests.get("https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option", timeout=15).json()
+        if 'result' in o_res:
+            rows = []
+            for x in o_res['result']:
+                parts = x['instrument_name'].split('-')
+                rows.append({'exp': parts[1], 'strike': float(parts[2]), 'type': parts[3], 'oi': float(x.get('open_interest', 0))})
+            results["options"] = pd.DataFrame(rows)
+    except Exception as e:
+        results["error"] = str(e)
+    
+    return results
 
-# --- 3. ИНИЦИАЛИЗАЦИЯ ДАННЫХ ---
-m_data = get_market_data()
+# --- 3. ИНИЦИАЛИЗАЦИЯ ---
+if st.sidebar.button("🔄 Сбросить кэш и обновить"):
+    st.cache_data.clear()
 
-# Дефолтные значения (чтобы не было NameError)
-max_pain_val = call_wall = put_wall = None
-pcr_val = 1.0
-df_f = pd.DataFrame()
+data = get_market_data()
+
+# Переменные по умолчанию
+price_now = data["price"] if data["price"] else 74000.0
+dvol_now = data["dvol"] if data["dvol"] else 55.0
+df_options = data["options"]
 
 st.title("🛡️ BTC Alpha Terminal: Polymarket Edition")
 
-# --- 4. РУЧНОЙ КОНТРОЛЬ (Sidebar) ---
+# Состояние API
+if data["error"]:
+    st.error(f"📡 Ошибка связи с биржей: {data['error']}. Включен ручной режим.")
+elif df_options.empty:
+    st.warning("📡 Опционы не загружены (ошибка API). Введите параметры стен вручную в сайдбаре.")
+else:
+    st.success("✅ Все данные синхронизированы с Deribit")
+
+# --- 4. SIDEBAR (Управление) ---
 with st.sidebar:
-    st.header("⚙️ Настройки")
+    st.header("⚙️ Параметры")
+    price_now = st.number_input("Текущая цена BTC", value=price_now)
+    dvol_now = st.slider("Текущий DVOL (%)", 10.0, 150.0, dvol_now)
     
-    price_now = st.number_input("Текущая цена BTC", value=m_data["price"] if m_data["price"] else 74000.0, step=100.0)
-    dvol_now = st.slider("Текущий DVOL (%)", 10.0, 150.0, m_data["dvol"] if m_data["dvol"] else 55.0)
-
     st.divider()
-    st.header("🎯 Твоя ставка")
-    p_high = st.number_input("Верх (No Above)", value=int(math.ceil(price_now/1000)*1000 + 5000), step=500)
-    p_low = st.number_input("Низ (No Below)", value=int(math.floor(price_now/1000)*1000 - 5000), step=500)
-    poly_px = st.slider("Цена токена (Polymarket)", 0.05, 0.99, 0.85)
-    bankroll = st.number_input("Депозит ($)", value=1000)
+    st.header("🎯 Polymarket")
+    p_high = st.number_input("Верхний барьер", value=int(math.ceil(price_now/1000)*1000 + 5000), step=500)
+    p_low = st.number_input("Нижний барьер", value=int(math.floor(price_now/1000)*1000 - 5000), step=500)
+    poly_px = st.slider("Цена токена (Cents)", 0.05, 0.99, 0.85)
 
-# --- 5. ЛОГИКА ОПЦИОНОВ ---
-if not m_data["options"].empty:
-    exps = sorted(m_data["options"]['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
-    sel_exp = st.selectbox("📅 Срок сделки (Экспирация):", exps)
-    df_f = m_data["options"][m_data["options"]['exp'] == sel_exp].copy()
+    # Ручной ввод стен, если API не дало опционы
+    if df_options.empty:
+        st.divider()
+        st.header("🧱 Ручные стены OI")
+        manual_mp = st.number_input("Ручной Max Pain", value=price_now)
+        manual_call_wall = st.number_input("Стена Call (Сопротивление)", value=price_now+10000)
+        manual_put_wall = st.number_input("Стена Put (Поддержка)", value=price_now-10000)
+        manual_days = st.number_input("Дней до экспирации", value=7)
+
+# --- 5. ОБРАБОТКА ДАННЫХ ---
+max_pain_val = call_wall = put_wall = None
+pcr_val = 1.0
+
+if not df_options.empty:
+    exps = sorted(df_options['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
+    sel_exp = st.selectbox("📅 Выберите экспирацию:", exps)
+    df_f = df_options[df_options['exp'] == sel_exp].copy()
     
     # Расчет Max Pain
     strikes = sorted(df_f['strike'].unique())
-    calls_df = df_f[df_f['type'] == 'C']
-    puts_df = df_f[df_f['type'] == 'P']
-    
-    if not calls_df.empty and not puts_df.empty:
-        pains = [(np.maximum(0, s - calls_df['strike']) * calls_df['oi']).sum() + 
-                 (np.maximum(0, puts_df['strike'] - s) * puts_df['oi']).sum() for s in strikes]
-        max_pain_val = strikes[np.argmin(pains)]
-        
-        # Стены и PCR
-        call_wall = calls_df.groupby('strike')['oi'].sum().idxmax()
-        put_wall = puts_df.groupby('strike')['oi'].sum().idxmax()
-        pcr_val = puts_df['oi'].sum() / calls_df['oi'].sum() if calls_df['oi'].sum() > 0 else 1.0
+    calls = df_f[df_f['type'] == 'C']; puts = df_f[df_f['type'] == 'P']
+    pains = [(np.maximum(0, s - calls['strike']) * calls['oi']).sum() + 
+             (np.maximum(0, puts['strike'] - s) * puts['oi']).sum() for s in strikes]
+    max_pain_val = strikes[np.argmin(pains)]
+    call_wall = calls.groupby('strike')['oi'].sum().idxmax()
+    put_wall = puts.groupby('strike')['oi'].sum().idxmax()
+    pcr_val = puts['oi'].sum() / calls['oi'].sum() if calls['oi'].sum() > 0 else 1.0
 
-    # Дни
     exp_dt = datetime.strptime(sel_exp, "%d%b%y").replace(tzinfo=timezone.utc)
     days = max((exp_dt - datetime.now(timezone.utc)).total_seconds() / 86400, 0.1)
 else:
-    st.warning("⚠️ Данные опционов недоступны. Используем ручной режим.")
-    days = st.number_input("Дней до экспирации", value=7.0)
+    # Если данных нет, используем ручные значения
+    max_pain_val = manual_mp
+    call_wall = manual_call_wall
+    put_wall = manual_put_wall
+    days = manual_days
+    strikes = [p_low, max_pain_val, p_high]
+    pains = [0, 0, 0]
 
 # --- 6. МАТЕМАТИКА ---
 sigma = (dvol_now / 100) * math.sqrt(days / 365)
 prob = norm.cdf((math.log(p_high/price_now)-0.5*sigma**2)/sigma) - norm.cdf((math.log(p_low/price_now)-0.5*sigma**2)/sigma)
 edge = prob - poly_px
-exp_move = price_now * sigma
 
-# Келли
-b_ratio = (1/poly_px) - 1
-k_bet = max(0, ((edge / b_ratio) if b_ratio > 0 else 0) * bankroll)
-
-# --- 7. ЭКРАН МЕТРИК ---
+# --- 7. ПАНЕЛЬ МЕТРИК ---
 st.divider()
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("📊 Шанс успеха", f"{prob*100:.1f}%")
+c1.metric("📊 Вероятность", f"{prob*100:.1f}%")
 c2.metric("💰 Edge", f"{edge*100:+.1f}%")
-c3.metric("🌪️ Ожид. ход (±)", f"${exp_move:,.0f}")
-c4.metric("⚖️ Sentiment (PCR)", f"{pcr_val:.2f}")
+c3.metric("🎯 Max Pain", f"${max_pain_val:,.0f}")
+c4.metric("⚖️ PCR", f"{pcr_val:.2f}")
 
-# --- 8. АНАЛИТИЧЕСКИЙ ВЕРДИКТ ---
-st.subheader("🤖 Стратегический вердикт")
-v_col1, v_col2 = st.columns([2, 1])
+# --- 8. АНАЛИЗ ---
+st.subheader("🤖 Аналитический вердикт")
+if edge > 0.05:
+    st.success(f"Сигнал к покупке: преимущество над рынком {edge*100:.1f}%. Твоя вероятность успеха значительно выше цены токена.")
+elif edge < -0.05:
+    st.error(f"Сигнал к пропуску: переплата {abs(edge)*100:.1f}%. Математически сделка убыточна.")
+else:
+    st.warning("Нейтральная зона: цена Polymarket соответствует риску.")
 
-with v_col1:
-    analysis = []
-    # 1. Edge
-    if edge > 0.05: analysis.append("✅ **МАТЕМАТИКА:** Отличный Edge. Токен на Polymarket недооценен.")
-    elif edge < -0.05: analysis.append("🔴 **МАТЕМАТИКА:** Отрицательный Edge. Ты переплачиваешь за риск.")
-    
-    # 2. Волатильность
-    if p_low > (price_now - exp_move) or p_high < (price_now + exp_move):
-        analysis.append(f"⚠️ **РИСК:** Коридор уже ожидаемого хода (${price_now - exp_move:,.0f} - ${price_now + exp_move:,.0f}).")
-    else:
-        analysis.append("🛡️ **ЗАПАС:** Твой коридор шире стандартного хода цены.")
-
-    # 3. Стены
-    if call_wall and put_wall:
-        analysis.append(f"🧱 **БАРЬЕРЫ:** Стена сопротивления на **${call_wall:,.0f}**, поддержка на **${put_wall:,.0f}**.")
-        analysis.append(f"🧲 **MAX PAIN:** Магнит маркет-мейкеров на уровне **${max_pain_val:,.0f}**.")
-
-    for msg in analysis: st.write(msg)
-
-with v_col2:
-    if k_bet > 0:
-        st.success(f"💵 **Рекомендуемая ставка:**\n\n**${k_bet:,.0f}**\n\n(по критерию Келли)")
-    else:
-        st.error("💵 **Ставка не рекомендуется**")
-
-# --- 9. ГРАФИКИ ---
+# --- 9. ГРАФИК (Теперь всегда работает) ---
 st.divider()
-t1, t2 = st.tabs(["📉 Max Pain Map", "📈 Probability Curve"])
+fig = go.Figure()
 
-with t1:
-    if not df_f.empty and max_pain_val:
-        # Пересчитываем для графика
-        strikes_plot = sorted(df_f['strike'].unique())
-        pains_plot = [(np.maximum(0, s - df_f[df_f['type']=='C']['strike']) * df_f[df_f['type']=='C']['oi']).sum() + 
-                      (np.maximum(0, df_f[df_f['type']=='P']['strike'] - s) * df_f[df_f['type']=='P']['oi']).sum() for s in strikes_plot]
-        
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=strikes_plot, y=pains_plot, name="Pain Curve", fill='tozeroy', line_color='#FF8C00'))
-        fig.add_vline(x=max_pain_val, line_dash="dash", line_color="red", annotation_text="MAX PAIN")
-        fig.add_vline(x=price_now, line_color="blue", line_width=3, annotation_text="PRICE")
-        
-        # Твоя зона PROFITS
-        fig.add_vrect(x0=p_low, x1=p_high, fillcolor="green", opacity=0.1, line_width=0)
-        fig.add_vline(x=p_low, line_dash="dot", line_color="green", annotation_text="LOW")
-        fig.add_vline(x=p_high, line_dash="dot", line_color="purple", annotation_text="HIGH")
-        
-        fig.update_layout(title="Зоны давления маркет-мейкеров", template="plotly_white")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("График появится после загрузки данных об опционах.")
+if not df_options.empty:
+    fig.add_trace(go.Scatter(x=strikes, y=pains, name="Зона боли ММ", fill='tozeroy', line_color='#FF8C00'))
+else:
+    # Заглушка графика, если данных нет
+    st.info("Внимание: график построен на ручных данных стен.")
 
-with t2:
-    x_dist = np.linspace(price_now * 0.7, price_now * 1.3, 200)
-    y_dist = norm.pdf(np.log(x_dist/price_now), -0.5 * sigma**2, sigma)
-    fig2 = go.Figure(go.Scatter(x=x_dist, y=y_dist, fill='tozeroy', line_color='#00CED1'))
-    fig2.add_vline(x=p_low, line_color="red", line_dash="dot")
-    fig2.add_vline(x=p_high, line_color="red", line_dash="dot")
-    fig2.update_layout(title="Плотность вероятности к дате экспирации", template="plotly_white")
-    st.plotly_chart(fig2, use_container_width=True)
+fig.add_vline(x=max_pain_val, line_dash="dash", line_color="red", annotation_text="MAX PAIN")
+fig.add_vline(x=price_now, line_color="blue", line_width=3, annotation_text="ЦЕНА")
+fig.add_vline(x=call_wall, line_color="red", line_width=1, annotation_text="WALL CALL")
+fig.add_vline(x=put_wall, line_color="green", line_width=1, annotation_text="WALL PUT")
+
+# Зона Polymarket
+fig.add_vrect(x0=p_low, x1=p_high, fillcolor="green", opacity=0.1, line_width=0)
+fig.add_vline(x=p_low, line_dash="dot", line_color="green", annotation_text="LOW")
+fig.add_vline(x=p_high, line_dash="dot", line_color="purple", annotation_text="HIGH")
+
+fig.update_layout(title="Карта рисков и Стены ликвидности", template="plotly_white")
+st.plotly_chart(fig, use_container_width=True)
