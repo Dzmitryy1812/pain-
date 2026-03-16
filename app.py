@@ -76,45 +76,52 @@ if price > 0 and not df.empty:
     max_pain = float(strikes[np.argmin(pains)])
 
     # --- МЕТРИКИ ---
-    st.markdown(f"### 📈 Рынок на {sel_exp}")
+    st.markdown(f"### 📈 Мониторинг рынка | {sel_exp}")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("BTC PRICE", f"${price:,.1f}")
+    m1.metric("ЦЕНА BTC", f"${price:,.1f}")
     m2.metric("MAX PAIN", f"${max_pain:,.0f}")
-    m3.metric("ДИСТАНЦИЯ", f"{((max_pain/price - 1)*100):.1f}%")
-    m4.metric("ДО КОНЦА", f"{hours_left/24:.1f} дн.")
+    m3.metric("К ЦЕЛИ", f"{((max_pain/price - 1)*100):.1f}%")
+    m4.metric("ВРЕМЯ", f"{hours_left/24:.1f} дн.")
 
-    # --- ФУНКЦИЯ ДЛЯ ОТРИСОВКИ ЛИНИЙ (ЧТОБЫ НЕ ПОВТОРЯТЬСЯ) ---
+    # --- УЛУЧШЕННАЯ ФУНКЦИЯ ОТРИСОВКИ ЛИНИЙ ---
     def add_layout_lines(fig):
-        # ТЕКУЩАЯ ЦЕНА - ЯРКАЯ И ТОЛСТАЯ
-        fig.add_vline(x=price, line_width=5, line_color="#FFFF00", # Ярко-желтый неон
-                      annotation_text=" ТЕКУЩАЯ ЦЕНА", annotation_font_color="#FFFF00", annotation_position="top left")
-        # ВАШИ ЗОНЫ
-        fig.add_vline(x=p_low, line_dash="dot", line_width=2, line_color="#00FFFF", 
-                      annotation_text=" YES", annotation_font_color="#00FFFF")
-        fig.add_vline(x=p_high, line_dash="dot", line_width=2, line_color="#FF4500", 
-                      annotation_text=" NO", annotation_font_color="#FF4500")
+        # ЧЕРНАЯ ЛИНИЯ ЦЕНЫ (С БЕЛЫМ КОНТУРОМ ДЛЯ ВИДИМОСТИ)
+        fig.add_vline(x=price, line_width=4, line_color="#000000", 
+                      annotation_text=f" ЦЕНА: {price:,.0f}", 
+                      annotation_font_color="#FFFFFF", # Белый текст для контраста
+                      annotation_bgcolor="#000000")    # Черный фон текста
+        
+        # ЛИНИИ POLYMARKET
+        fig.add_vline(x=p_low, line_dash="dash", line_width=2, line_color="#00FFFF", 
+                      annotation_text=" YES 🟢", annotation_font_color="#00FFFF")
+        fig.add_vline(x=p_high, line_dash="dash", line_width=2, line_color="#FF4500", 
+                      annotation_text=" NO 🔴", annotation_font_color="#FF4500")
 
     # --- ГРАФИК GEX ---
     fig_gex = go.Figure()
-    fig_gex.add_trace(go.Bar(x=strikes, y=gex_vals, marker_color=['#00FF00' if x > 0 else '#FF0000' for x in gex_vals]))
+    fig_gex.add_trace(go.Bar(x=strikes, y=gex_vals, name="Gamma",
+                             marker_color=['#00FF00' if x > 0 else '#FF0000' for x in gex_vals]))
     add_layout_lines(fig_gex)
-    fig_gex.update_layout(title="ПРОФИЛЬ ГАММЫ (GEX)", template="plotly_dark", height=400)
+    fig_gex.update_layout(title="ПРОФИЛЬ ГАММЫ (GEX)", template="plotly_dark", height=450)
     st.plotly_chart(fig_gex, use_container_width=True)
 
     # --- ГРАФИК HEATMAP (PAIN) ---
     fig_pain = go.Figure()
     fig_pain.add_trace(go.Scatter(x=strikes, y=pains, fill='tozeroy', line_color='#E066FF', name="Pain"))
-    add_layout_lines(fig_pain) # ТЕПЕРЬ ЛИНИИ И ТУТ
-    fig_pain.add_vline(x=max_pain, line_dash="dash", line_color="white", annotation_text=" MAX PAIN")
+    add_layout_lines(fig_pain)
+    fig_pain.add_vline(x=max_pain, line_dash="dot", line_color="#FFFFFF", annotation_text=" MAX PAIN")
     fig_pain.update_layout(title="MAX PAIN HEATMAP (КАРТА БОЛИ)", template="plotly_dark", height=400)
     st.plotly_chart(fig_pain, use_container_width=True)
 
-    # --- УПРАВЛЕНИЕ РИСКАМИ ---
+    # --- БЛОК ТЕТА-РАСПАДА ---
     st.divider()
-    c_low, c_high = st.columns(2)
-    d_l, d_h = (price/p_low - 1)*100, (p_high/price - 1)*100
-    c_low.write(f"🛡️ До НИЗА ({p_low:,.0f}): **{d_l:.1f}%**")
-    c_high.write(f"⚠️ До ВЕРХА ({p_high:,.0f}): **{d_h:.1f}%**")
+    progress = max(0, min(100, int(100 - (hours_left / 168 * 100))))
+    st.write(f"**⏳ Прогресс экспирации недели:** {progress}%")
+    st.progress(progress)
     
+    c_l, c_h = st.columns(2)
+    c_l.info(f"До поддержки (YES): {((price/p_low - 1)*100):.1f}%")
+    c_h.warning(f"До барьера (NO): {((p_high/price - 1)*100):.1f}%")
+
 else:
-    st.error("Данные не загружены.")
+    st.error("Данные API временно недоступны.")
