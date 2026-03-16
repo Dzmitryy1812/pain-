@@ -50,10 +50,45 @@ def calculate_pains(df):
     return float(strikes[np.argmin(pains)]), strikes, pains
 
 def calc_probability(price, low, high, vol, days):
-    t_y = max(days / 365, 0.0001)
-    std = (vol / 100) * math.sqrt(t_y)
-    p = norm.cdf((math.log(high/price) + 0.5*std**2)/std) - norm.cdf((math.log(low/price) + 0.5*std**2)/std)
-    return p
+    """
+    Расчет вероятности того, что цена BTC окажется внутри диапазона [low, high]
+    Используется d2 из модели Блэка-Шоулза (Risk-neutral probability).
+    """
+    if days <= 0:
+        return 1.0 if low <= price <= high else 0.0
+    
+    t_y = days / 365
+    sigma = vol / 100
+    stdev = sigma * math.sqrt(t_y)
+    
+    # Расчет d2 для верхнего и нижнего барьера
+    # d2 = (ln(S/K) + (r - 0.5 * sigma^2) * T) / (sigma * sqrt(T))
+    # Принимаем безрисковую ставку r = 0 для крипты
+    
+    d2_low = (math.log(price / low) - 0.5 * sigma**2 * t_y) / stdev
+    d2_high = (math.log(price / high) - 0.5 * sigma**2 * t_y) / stdev
+    
+    # Вероятность P(S > low) = norm.cdf(d2_low)
+    # Вероятность P(S > high) = norm.cdf(d2_high)
+    prob_above_low = norm.cdf(d2_low)
+    prob_above_high = norm.cdf(d2_high)
+    
+    # Вероятность нахождения ВНУТРИ коридора
+    return prob_above_low - prob_above_high
+
+# --- В блоке CALCULATION ---
+# 1. Считаем справедливую вероятность коридора
+prob_theoretical = calc_probability(calc_price, p_low, p_high, calc_dvol, days_to_exp)
+
+# 2. Считаем стоимость позиции
+# Если вы берете "Above 68k: YES" и "Above 78k: NO"
+# Общая стоимость = цена 1-й ноги + цена 2-й ноги
+# Важно: Сумма стоимостей этих двух ордеров должна быть < 1.0
+total_cost = poly_1 + poly_2 
+
+# 3. Считаем Edge
+# Если теоретическая вероятность 55%, а вы платите 0.45$, ваш Edge = +10%
+edge = prob_theoretical - total_cost
 
 # --- 4. SIDEBAR ---
 live_p, live_v, last_upd = get_market_data()
