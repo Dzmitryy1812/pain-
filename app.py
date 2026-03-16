@@ -6,68 +6,77 @@ import time
 
 st.set_page_config(page_title="Real Max Pain [Deribit]", layout="wide")
 
-# --- 1. ПОЛУЧЕНИЕ РЕАЛЬНЫХ ДАННЫХ С DERIBIT ---
+# Заголовки для обхода блокировок Cloudflare/Deribit
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'application/json'
+}
+
 @st.cache_data(ttl=300) 
 def get_deribit_options_data():
     try:
-        # Публичный запрос всех опционов BTC
         url = "https://www.deribit.com"
-        response = requests.get(url, timeout=15).json()
+        # Добавляем headers в запрос
+        response = requests.get(url, headers=HEADERS, timeout=15)
         
-        if 'result' not in response:
+        if response.status_code != 200:
+            st.error(f"Биржа отклонила запрос (Код {response.status_code}). Попробуйте позже.")
             return pd.DataFrame()
             
-        data = response['result']
+        result = response.json().get('result', [])
         rows = []
         
-        for item in data:
-            name = item['instrument_name'] # Напр: BTC-27MAR26-70000-C
+        for item in result:
+            name = item['instrument_name'] # BTC-27MAR26-70000-C
             parts = name.split('-')
             if len(parts) >= 4:
-                rows.append({
-                    'strike': float(parts[2]),
-                    'type': parts[3], # C или P
-                    'oi': float(item['open_interest'])
-                })
+                try:
+                    rows.append({
+                        'strike': float(parts[2]),
+                        'type': parts[3], # C или P
+                        'oi': float(item['open_interest'])
+                    })
+                except: continue
         
         return pd.DataFrame(rows)
     except Exception as e:
-        st.error(f"Ошибка Deribit API: {e}")
+        st.error(f"Ошибка соединения: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=20)
 def get_btc_price():
     try:
-        # Индексная цена самого Deribit для точности
         url = "https://www.deribit.com"
-        return float(requests.get(url).json()['result']['index_price'])
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        return float(response.json()['result']['index_price'])
     except:
-        return 0.0
+        # Запасной вариант через CryptoCompare если Deribit блокирует
+        try:
+            res = requests.get("https://min-api.cryptocompare.com", timeout=5)
+            return float(res.json()['USD'])
+        except:
+            return 0.0
 
-# --- 2. РАСЧЕТ MAX PAIN ---
+# --- РАСЧЕТ ---
 def calculate_real_max_pain(df):
-    # Берем уникальные страйки как точки проверки
     unique_strikes = np.sort(df['strike'].unique())
-    
-    # Оптимизируем: считаем только страйки в диапазоне +/- 30% от цены, чтобы не тормозило
+    # Фильтруем страйки для ускорения, берем только те, где есть OI
     pains = []
+    
+    # Считаем боль для каждого страйка
     for test_strike in unique_strikes:
-        # Убытки Call (цена выше страйка)
         calls = df[df['type'] == 'C']
-        call_pain = np.sum(np.maximum(0, test_strike - calls['strike']) * calls['oi'])
-        
-        # Убытки Put (цена ниже страйка)
         puts = df[df['type'] == 'P']
-        put_pain = np.sum(np.maximum(0, puts['strike'] - test_strike) * puts['oi'])
         
-        pains.append(call_pain + put_pain)
+        c_pain = np.sum(np.maximum(0, test_strike - calls['strike']) * calls['oi'])
+        p_pain = np.sum(np.maximum(0, puts['strike'] - test_strike) * puts['oi'])
+        pains.append(c_pain + p_pain)
     
     max_pain_price = unique_strikes[np.argmin(pains)]
     return max_pain_price, unique_strikes, pains
 
 # --- ИНТЕРФЕЙС ---
-st.title("🎯 Real BTC Max Pain (Live Deribit Data)")
-st.write("Скрипт анализирует реальный Open Interest всех опционов на бирже.")
+st.title("🎯 Real BTC Max Pain (Deribit API)")
 
 price = get_btc_price()
 df_options = get_deribit_options_data()
@@ -75,7 +84,6 @@ df_options = get_deribit_options_data()
 if not df_options.empty and price > 0:
     real_max_pain, all_strikes, all_pains = calculate_real_max_pain(df_options)
 
-    # 1. МЕТРИКИ
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("BTC INDEX", f"${price:,.2f}")
@@ -87,16 +95,16 @@ if not df_options.empty and price > 0:
 
     st.divider()
     
-    # 2. ГРАФИК
-    st.subheader("Профиль боли (все экспирации)")
-    # Фильтруем график для читаемости (около текущей цены)
     chart_df = pd.DataFrame({'Pain': all_pains}, index=all_strikes)
-    mask = (chart_df.index > price * 0.5) & (chart_df.index < price * 1.5)
-    st.area_chart(chart_df[mask], color="#00ffcc")
-
-    st.info(f"Проанализировано инструментов: {len(df_options)}")
+    # Показываем только актуальный диапазон вокруг цены
+    view = chart_df[(chart_df.index > price * 0.4) & (chart_df.index < price * 1.6)]
+    st.area_chart(view, color="#00ffcc")
+    
+    st.info(f"Анализ завершен. Найдено {len(df_options)} активных контрактов.")
 else:
-    st.info("Подключение к Deribit... Пожалуйста, подождите.")
+    st.warning("🔄 Ожидание ответа от Deribit API... Попробуйте обновить страницу через 10 секунд.")
+    if st.button("Обновить принудительно"):
+        st.rerun()
 
 st.caption(f"Обновлено: {time.strftime('%H:%M:%S')} UTC")
 
