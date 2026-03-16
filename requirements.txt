@@ -2,3 +2,5 @@ streamlit
 ccxt
 pandas
 plotly
+numpy
+scipy
