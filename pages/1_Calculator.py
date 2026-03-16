@@ -129,28 +129,90 @@ st.divider()
 ai_text = f"BTC: ${price_now:,.0f} | Expiry: {sel_exp} | Range: {p_low}-{p_high} | Prob: {prob*100:.1f}% | Edge: {edge*100:.1f}% | Kelly Bet: ${suggested_bet:.0f}"
 st.code(ai_text, language="markdown")
 
+from plotly.subplots import make_subplots
+
 # --- 8. CHARTS ---
-t1, t2, t3 = st.tabs(["📊 Max Pain Map", "📈 IV Smile", "🧮 Option Chain"])
+t1, t2 = st.tabs(["📈 Hybrid: Pain & Smile", "🔥 OI Heatmap Cluster"])
 
 with t1:
-    if strikes_p:
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=strikes_p, y=values_p, name="Total Pain", line=dict(color="#636EFA", width=3)))
-        fig1.add_vline(x=max_pain_val, line_dash="dash", line_color="red", annotation_text="Max Pain")
-        fig1.add_vline(x=price_now, line_dash="dot", line_color="green", annotation_text="Current Price")
-        fig1.update_layout(template="plotly_white", title="Max Pain Distribution", xaxis_title="Strike", yaxis_title="Loss Value")
+    if not df_opt.empty and len(strikes_p) > 0:
+        # Создаем график с двумя осями Y
+        fig1 = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # 1. Линия Max Pain
+        fig1.add_trace(
+            go.Scatter(x=strikes_p, y=values_p, name="Total Pain (Losses)", 
+                       line=dict(color="rgba(99, 110, 250, 0.8)", width=4)),
+            secondary_y=False
+        )
+
+        # 2. Линия IV Smile
+        if not mean_ivs.empty:
+            fig1.add_trace(
+                go.Scatter(x=mean_ivs.index, y=mean_ivs.values, name="IV Smile (%)", 
+                           line=dict(color="rgba(239, 85, 59, 0.8)", width=3, dash='dot')),
+                secondary_y=True
+            )
+
+        # Добавляем вертикальные линии индикаторов
+        fig1.add_vline(x=max_pain_val, line_dash="dash", line_color="blue", 
+                       annotation_text=f"Max Pain ${max_pain_val:,.0f}")
+        fig1.add_vline(x=price_now, line_dash="solid", line_color="green", 
+                       annotation_text="Current Price")
+        
+        # Подсветка зоны интереса (вашего диапазона)
+        fig1.add_vrect(x0=p_low, x1=p_high, fillcolor="rgba(0, 255, 0, 0.1)", 
+                       line_width=0, annotation_text="Target range")
+
+        fig1.update_layout(
+            title=f"Market Structure for {sel_exp}",
+            template="plotly_white",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+
+        fig1.update_yaxes(title_text="<b>Options Pain</b> (USD)", secondary_y=False)
+        fig1.update_yaxes(title_text="<b>Implied Volatility</b> (%)", secondary_y=True)
+        
         st.plotly_chart(fig1, use_container_width=True)
 
 with t2:
-    if not mean_ivs.empty:
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=mean_ivs.index, y=mean_ivs.values, name="IV Smile", mode='lines+markers'))
-        fig2.add_vrect(x0=p_low, x1=p_high, fillcolor="green", opacity=0.1, annotation_text="Your Range")
-        fig2.update_layout(template="plotly_white", title="Implied Volatility Smile", xaxis_title="Strike", yaxis_title="IV %")
-        st.plotly_chart(fig2, use_container_width=True)
-
-with t3:
     if not df_opt.empty:
-        st.dataframe(df_f.sort_values("strike"), use_container_width=True)
+        # Подготовка данных для тепловой карты
+        # Фильтруем страйки в радиусе 30% от текущей цены для красоты
+        mask = (df_opt['strike'] > price_now * 0.7) & (df_opt['strike'] < price_now * 1.3)
+        df_heat = df_opt[mask].copy()
+        
+        # Группируем OI по страйкам и экспирациям
+        heatmap_data = df_heat.pivot_table(
+            index='strike', 
+            columns='exp', 
+            values='oi', 
+            aggfunc='sum'
+        ).fillna(0)
+        
+        # Сортируем колонки по дате
+        sorted_cols = sorted(heatmap_data.columns, key=lambda x: datetime.strptime(x, "%d%b%y"))
+        heatmap_data = heatmap_data[sorted_cols]
 
-st.caption(f"Data updated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        fig2 = go.Figure(data=go.Heatmap(
+            z=heatmap_data.values,
+            x=heatmap_data.columns,
+            y=heatmap_data.index,
+            colorscale='Viridis',
+            hoverongaps = False,
+            colorbar=dict(title="OI (BTC)")
+        ))
+
+        fig2.update_layout(
+            title="Open Interest Concentration (Strike vs Expiry)",
+            xaxis_title="Expiration Date",
+            yaxis_title="Strike Price ($)",
+            template="plotly_white",
+            height=600
+        )
+        
+        # Линия текущей цены на теплокарте
+        fig2.add_hline(y=price_now, line_dash="dash", line_color="white", annotation_text="Current Price")
+
+        st.plotly_chart(fig2, use_container_width=True)
