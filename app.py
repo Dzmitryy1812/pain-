@@ -1,106 +1,89 @@
 import streamlit as st
-import numpy as np
 import pandas as pd
+import numpy as np
+import requests
 import time
-import yfinance as yf  # Более стабильный источник
 
-# 1. НАСТРОЙКА СТРАНИЦЫ
-st.set_page_config(page_title="Max Pain [BackQuant]", layout="wide")
+st.set_page_config(page_title="Real Max Pain [Deribit]", layout="wide")
 
-# --- ФУНКЦИЯ ПОЛУЧЕНИЯ ЦЕНЫ BTC (ЧЕРЕЗ YFINANCE) ---
-@st.cache_data(ttl=15)
+# --- 1. ПОЛУЧЕНИЕ РЕАЛЬНЫХ ДАННЫХ С DERIBIT ---
+@st.cache_data(ttl=300) # Кэшируем на 5 минут, так как данных много
+def get_deribit_options_data():
+    try:
+        # Получаем список всех инструментов (опционов) BTC
+        url = "https://www.deribit.com"
+        data = requests.get(url, timeout=10).json()['result']
+        
+        df = pd.DataFrame(data)
+        # Извлекаем Страйк и Тип (Call/Put) из названия (напр. BTC-27MAR26-70000-C)
+        df['strike'] = df['instrument_name'].str.split('-').str[2].astype(float)
+        df['type'] = df['instrument_name'].str.split('-').str[3]
+        # Нам нужен Open Interest
+        df['oi'] = df['open_interest'].astype(float)
+        
+        return df
+    except Exception as e:
+        st.error(f"Ошибка получения данных с Deribit: {e}")
+        return pd.DataFrame()
+
+@st.cache_data(ttl=30)
 def get_btc_price():
     try:
-        # Тикер BTC-USD от Yahoo Finance
-        ticker = yf.Ticker("BTC-USD")
-        # Берем последнюю цену закрытия
-        data = ticker.fast_info['last_price']
-        return float(data)
-    except Exception as e:
-        # Если и Yahoo упадет, попробуем Binance (как запасной)
-        st.error(f"Yahoo API Error: {e}. Пробую резервный канал...")
+        url = "https://api.binance.com"
+        return float(requests.get(url).json()['price'])
+    except:
         return 0.0
 
-# --- МАТЕМАТИЧЕСКАЯ ЛОГИКА (ПОРТ ИЗ PINE SCRIPT) ---
-def calculate_max_pain(current_price, range_pct, n_strikes, p_c_ratio, expiry_days):
-    strike_min = current_price * (1 - range_pct/100)
-    strike_max = current_price * (1 + range_pct/100)
-    strikes = np.linspace(strike_min, strike_max, int(n_strikes))
-    
-    def estimate_oi(strike, price):
-        dist_pct = abs(strike - price) / price
-        base_factor = 1 / (1 + dist_pct * 8)
-        decay = 0.8 ** (dist_pct * 15)
-        base_volume = 1000000 * base_factor * decay * 0.02
-        weekly_mult = 1.2 if expiry_days <= 7 else 1.0
-        return base_volume * weekly_mult
-
+# --- 2. РАСЧЕТ MAX PAIN ПО РЕАЛЬНОМУ OI ---
+def calculate_real_max_pain(df):
+    strikes = sorted(df['strike'].unique())
     pains = []
-    for test_strike in strikes:
-        total_pain = 0
-        for s in strikes:
-            call_oi = estimate_oi(s, current_price)
-            put_oi = call_oi * p_c_ratio
-            call_pain = max(0, test_strike - s) * call_oi
-            put_pain = max(0, s - test_strike) * put_oi
-            total_pain += (call_pain + put_pain)
-        pains.append(total_pain)
     
-    max_pain_level = strikes[np.argmin(pains)]
-    return max_pain_level, strikes, pains
+    for test_strike in strikes:
+        # Убытки Call: если цена выше страйка
+        calls = df[df['type'] == 'C']
+        call_pain = ((test_strike - calls['strike']).clip(lower=0) * calls['oi']).sum()
+        
+        # Убытки Put: если цена ниже страйка
+        puts = df[df['type'] == 'P']
+        put_pain = ((puts['strike'] - test_strike).clip(lower=0) * puts['oi']).sum()
+        
+        pains.append(call_pain + put_pain)
+    
+    max_pain_price = strikes[np.argmin(pains)]
+    return max_pain_price, strikes, pains
 
-# --- ИНТЕРФЕЙС (SIDEBAR) ---
-st.sidebar.header("⚙️ Настройки модели")
-n_strikes = st.sidebar.number_input("Кол-во страйков", min_value=5, max_value=100, value=30, step=5)
-expiry_days = st.sidebar.slider("Дней до экспирации", min_value=1, max_value=60, value=7)
-strike_range_pct = st.sidebar.slider("Диапазон страйков %", min_value=5.0, max_value=30.0, value=15.0)
-put_call_ratio = st.sidebar.slider("Put/Call Ratio", min_value=0.1, max_value=3.0, value=1.2, step=0.1)
+# --- ИНТЕРФЕЙС ---
+st.title("🎯 Real BTC Max Pain (Deribit API)")
 
-# --- ОСНОВНОЙ ЭКРАН ---
-st.title("🎯 BTC Max Pain Calculator [BackQuant]")
+price = get_btc_price()
+df_options = get_deribit_options_data()
 
-btc_price = get_btc_price()
+if not df_options.empty and price > 0:
+    real_max_pain, all_strikes, all_pains = calculate_real_max_pain(df_options)
 
-# Если цена не получена, пробуем еще раз или выводим заглушку
-if btc_price == 0:
-    st.warning("🔄 Переподключение к потоку данных...")
-    time.sleep(2)
-    st.rerun()
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("BTC PRICE", f"${price:,.2f}")
+    with col2:
+        # Теперь это РЕАЛЬНОЕ число с биржи
+        st.metric("REAL MAX PAIN", f"${real_max_pain:,.0f}")
+    with col3:
+        diff = price - real_max_pain
+        st.metric("DEVIATION", f"${diff:,.0f}", delta=f"{(diff/real_max_pain*100):.2f}%", delta_color="inverse")
 
-# Основной расчет
-max_pain, strikes, pains = calculate_max_pain(btc_price, strike_range_pct, n_strikes, put_call_ratio, expiry_days)
+    st.divider()
+    
+    # График реальной "боли"
+    st.subheader("Карта боли по всем открытым позициям (Deribit)")
+    # Ограничим график для наглядности (вокруг текущей цены)
+    chart_df = pd.DataFrame({'Pain': all_pains}, index=all_strikes)
+    view_df = chart_df[(chart_df.index > price * 0.7) & (chart_df.index < price * 1.3)]
+    st.area_chart(view_df, color="#00ffcc")
 
-# 1. МЕТРИКИ
-m1, m2, m3 = st.columns(3)
-with m1:
-    st.metric("BTC PRICE", f"${btc_price:,.2f}")
-with m2:
-    st.metric("MAX PAIN", f"${max_pain:,.0f}")
-with m3:
-    diff = btc_price - max_pain
-    diff_pct = (diff / max_pain) * 100
-    st.metric("ОТКЛОНЕНИЕ", f"${diff:,.0f}", delta=f"{diff_pct:+.2f}%", delta_color="inverse")
-
-st.divider()
-
-# 2. ГРАФИК ПРОФИЛЯ БОЛИ
-st.subheader("Pain Profile (Options Expiry)")
-chart_df = pd.DataFrame({
-    'Pain Value': pains
-}, index=np.round(strikes, 0))
-
-st.area_chart(chart_df, color="#ff4b4b", use_container_width=True)
-
-# 3. АНАЛИЗ ЗОНЫ PIN RISK
-current_diff_pct = abs(btc_price - max_pain) / btc_price
-if current_diff_pct <= 0.02:
-    st.warning(f"⚠️ ВЫСОКИЙ PIN RISK: Цена притянута к страйку ${max_pain:,.0f}")
+    st.info(f"Данные проанализированы по {len(df_options)} активным опционным контрактам.")
 else:
-    st.info("❄️ MARKET NEUTRAL")
+    st.warning("Загрузка данных с биржи...")
 
-st.divider()
-st.caption(f"Обновлено: {time.strftime('%H:%M:%S')} UTC | Источник: Yahoo Finance")
-
-# Автообновление
-time.sleep(30)
+time.sleep(60)
 st.rerun()
