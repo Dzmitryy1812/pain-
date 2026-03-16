@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 from scipy.stats import norm
 
 # --- 1. CONFIG ---
-st.set_page_config(page_title="BTC Alpha Terminal v5.1", layout="wide")
+st.set_page_config(page_title="BTC Alpha Terminal v5.0", layout="wide")
 
-# --- 2. DATA SOURCE ---
+# --- 2. DATA SOURCE (LIVE) ---
 @st.cache_data(ttl=60)
 def get_market_data():
     try:
@@ -21,7 +21,7 @@ def get_market_data():
         dvol = float(v_res['result']['data'][-1][3])
         return price, dvol, datetime.now().strftime("%H:%M:%S")
     except:
-        return 68000.0, 55.0, "API Error"
+        return 65000.0, 50.0, "API Error"
 
 @st.cache_data(ttl=300)
 def get_options_book():
@@ -39,7 +39,7 @@ def get_options_book():
     except:
         return pd.DataFrame()
 
-# --- 3. MATH ---
+# --- 3. MATH FUNCTIONS ---
 def calculate_pains(df):
     if df.empty: return 0, [], []
     strikes = sorted(df['strike'].unique())
@@ -50,17 +50,10 @@ def calculate_pains(df):
     return float(strikes[np.argmin(pains)]), strikes, pains
 
 def calc_probability(price, low, high, vol, days):
-    if days <= 0: return 1.0 if low <= price <= high else 0.0
-    if low >= high: return 0.0
-    
-    t_y = days / 365
+    t_y = max(days / 365, 0.0001)
     std = (vol / 100) * math.sqrt(t_y)
-    
-    d2_high = (math.log(high/price) - 0.5 * std**2) / std
-    d2_low = (math.log(low/price) - 0.5 * std**2) / std
-    
-    prob = norm.cdf(d2_high) - norm.cdf(d2_low)
-    return max(0, min(1, prob))
+    p = norm.cdf((math.log(high/price) + 0.5*std**2)/std) - norm.cdf((math.log(low/price) + 0.5*std**2)/std)
+    return p
 
 # --- 4. SIDEBAR ---
 live_p, live_v, last_upd = get_market_data()
@@ -68,94 +61,126 @@ df_all = get_options_book()
 
 with st.sidebar:
     st.header(f"💰 BTC Spot: ${live_p:,.0f}")
-    if st.button("🔄 Обновить API"):
+    st.caption(f"Обновлено: {last_upd}")
+    if st.button("🔄 Обновить данные"):
         st.cache_data.clear()
         st.rerun()
     
-    calc_price = st.number_input("Расчетная цена BTC ($)", value=int(live_p))
-    calc_dvol = st.number_input("Расчетная IV (DVOL) %", value=live_v)
+    st.divider()
+    calc_price = st.number_input("Расчетная цена BTC ($)", value=int(live_p), step=100)
+    calc_dvol = st.number_input("Расчетная IV (DVOL) %", value=live_v, step=0.5)
     
     st.divider()
-    st.markdown("### 🎯 Диапазон (Polymarket)")
-    # Авто-коррекция: чтобы low не был больше high
-    p_low_in = st.number_input("Нижний барьер ($)", value=int(calc_price - 2000))
-    p_high_in = st.number_input("Верхний барьер ($)", value=int(calc_price + 2000))
-    p_low = min(p_low_in, p_high_in)
-    p_high = max(p_low_in, p_high_in)
+    st.markdown("### 🎯 Диапазон стратегии")
+    p_low = st.number_input("Нижний барьер ($)", value=int(calc_price - 3000), step=500)
+    p_high = st.number_input("Верхний барьер ($)", value=int(calc_price + 3000), step=500)
     
-    st.markdown("### 💸 Стоимость акций YES")
-    poly_1 = st.number_input("Цена 1-й ноги", value=0.40, min_value=0.0, max_value=1.0)
-    poly_2 = st.number_input("Цена 2-й ноги", value=0.40, min_value=0.0, max_value=1.0)
+    st.markdown("### 💸 Polymarket (2 Ноги)")
+    poly_1 = st.number_input("Цена 1-й ноги (0-1)", value=0.42, step=0.01)
+    poly_2 = st.number_input("Цена 2-й ноги (0-1)", value=0.40, step=0.01)
     total_cost = poly_1 + poly_2
-    
-    if total_cost > 1.0:
-        st.warning(f"⚠️ Стоимость {total_cost:.2f} > 1.0! Это гарантированный убыток.")
 
     if not df_all.empty:
         exps = sorted(list(df_all['exp'].unique()), key=lambda x: datetime.strptime(x, "%d%b%y"))
-        sel_exp = st.selectbox("📅 Экспирация", exps)
+        sel_exp = st.selectbox("📅 Дата экспирации", exps, index=0)
     else:
         sel_exp = "N/A"
 
-# --- 5. MAIN ---
+# --- 5. CALCULATION ---
 if not df_all.empty and sel_exp != "N/A":
     df = df_all[df_all['exp'] == sel_exp].copy()
     max_pain_val, strikes_v, pains_v = calculate_pains(df)
-    
-    exp_dt = datetime.strptime(sel_exp, "%d%b%y").replace(tzinfo=timezone.utc)
-    # Считаем разницу в днях более точно (с плавающей запятой)
-    dt_now = datetime.now(timezone.utc)
-    days_to_exp = (exp_dt - dt_now).total_seconds() / 86400
+    mean_ivs = df[df['iv'] > 0].groupby('strike')['iv'].mean().sort_index()
 
+    # Time to expiry
+    exp_dt = datetime.strptime(sel_exp, "%d%b%y").replace(tzinfo=timezone.utc)
+    days_to_exp = max((exp_dt - datetime.now(timezone.utc)).total_seconds() / 86400, 0.01)
+    
+    # Prob calculations
     prob = calc_probability(calc_price, p_low, p_high, calc_dvol, days_to_exp)
     edge = prob - total_cost
 
-    st.title("🛡️ BTC Alpha Terminal v5.1")
+    # OI Metrics
+    range_oi = df[(df['strike'] >= p_low) & (df['strike'] <= p_high)]['oi'].sum()
+    total_oi = df['oi'].sum()
+
+    # --- 6. UI ---
+    st.title("🛡️ BTC Alpha Terminal v5.0")
     
     # Метрики
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Win Probability", f"{prob*100:.1f}%")
-    m2.metric("Edge (Преимущество)", f"{edge*100:+.1f}%", delta=f"{edge*100:.1f}%")
-    m3.metric("Затраты (Poly)", f"{total_cost:.2f}")
-    m4.metric("Max Pain", f"${max_pain_val:,.0f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Win Probability", f"{prob*100:.1f}%")
+    c2.metric("Edge (Матожидание)", f"{edge*100:+.1f}%", delta=f"{edge*100:.1f}%")
+    c3.metric("Общая стоимость", f"{total_cost:.2f}")
+    c4.metric("Max Pain", f"${max_pain_val:,.0f}")
 
-    if days_to_exp < 0:
-        st.error("❌ Выбрана истекшая экспирация!")
-    elif prob == 0:
-        st.error(f"⚠️ Вероятность 0%. Цена {calc_price} слишком далеко от диапазона {p_low}-{p_high} для срока {days_to_exp:.1f} дн.")
-
-    # График OI
+    # Основной график Ликвидности и Pain
+    st.subheader("📊 Анализ Ликвидности и Max Pain")
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     oi_data = df.groupby('strike')['oi'].sum().reset_index()
     
+    # 1. Столбцы OI (Высота зависит от объема)
     fig.add_trace(go.Bar(
-        x=oi_data['strike'], y=oi_data['oi'], name="OI (BTC)",
-        marker=dict(color=oi_data['oi'], colorscale='Viridis'), opacity=0.7
+        x=oi_data['strike'], y=oi_data['oi'],
+        name="Open Interest (BTC)",
+        marker=dict(color=oi_data['oi'], colorscale='Viridis', showscale=False),
+        opacity=0.7
     ), secondary_y=False)
 
+    # 2. Линия Pain
     fig.add_trace(go.Scatter(
-        x=strikes_v, y=pains_v, name="Max Pain Curve",
-        line=dict(color='royalblue', width=2), fill='tozeroy'
+        x=strikes_v, y=pains_v,
+        name="MM Pain Curve",
+        line=dict(color='rgba(100, 150, 255, 0.8)', width=3),
+        fill='tozeroy', fillcolor='rgba(100, 150, 255, 0.1)'
     ), secondary_y=True)
 
-    fig.add_vrect(x0=p_low, x1=p_high, fillcolor="rgba(0, 255, 0, 0.1)", annotation_text="ВАША ЗОНА")
-    fig.add_vline(x=calc_price, line_color="red", annotation_text="SPOT")
-    
-    fig.update_layout(height=500, xaxis=dict(range=[calc_price*0.9, calc_price*1.1]), template="plotly_white")
+    # Оформление
+    fig.add_vrect(x0=p_low, x1=p_high, fillcolor="rgba(0, 255, 0, 0.05)", 
+                  line=dict(color="green", dash="dash"), annotation_text="ВАША ЗОНА")
+    fig.add_vline(x=calc_price, line_color="red", line_width=2, annotation_text="SPOT")
+
+    fig.update_layout(height=500, template="plotly_white", xaxis=dict(range=[calc_price*0.8, calc_price*1.2]),
+                      legend=dict(orientation="h", y=1.1), hovermode="x unified")
+    fig.update_yaxes(title_text="Объем контрактов (BTC)", secondary_y=False)
+    fig.update_yaxes(title_text="Убыток ММ ($)", secondary_y=True)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Тета и Вега (дополнительно)
-    col_t, col_v = st.columns(2)
-    with col_t:
-        steps = np.linspace(days_to_exp, 0.001, 10)
-        t_probs = [calc_probability(calc_price, p_low, p_high, calc_dvol, s) for s in steps]
-        fig_t = go.Figure(go.Scatter(x=steps[::-1], y=t_probs[::-1], name="Theta Scan"))
-        fig_t.update_layout(title="Рост вероятности к экспирации (Theta)", xaxis_title="Дней до конца", height=300)
+    # Стратегический блок: Тета и Вега
+    st.divider()
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.subheader("⏳ Временной распад (Theta)")
+        t_steps = np.linspace(days_to_exp, 0.01, 15)
+        t_probs = [calc_probability(calc_price, p_low, p_high, calc_dvol, d) for d in t_steps]
+        
+        fig_t = go.Figure()
+        fig_t.add_trace(go.Scatter(x=[f"{d:.1f}д" for d in t_steps], y=t_probs, mode='lines+markers', line=dict(color='gold')))
+        fig_t.add_hline(y=total_cost, line_dash="dash", line_color="red", annotation_text="Точка окупаемости")
+        fig_t.update_layout(height=350, title="Рост 'справедливой цены' со временем", yaxis=dict(range=[0, 1]))
         st.plotly_chart(fig_t, use_container_width=True)
-    
-    with col_v:
-        v_steps = np.linspace(calc_dvol*0.5, calc_dvol*1.5, 10)
+
+    with col_b:
+        st.subheader("⚡ Влияние Волатильности (Vega)")
+        v_steps = np.linspace(max(10, calc_dvol-20), calc_dvol+20, 15)
         v_probs = [calc_probability(calc_price, p_low, p_high, v, days_to_exp) for v in v_steps]
-        fig_v = go.Figure(go.Scatter(x=v_steps, y=v_probs, name="Vega Scan", line=dict(color="cyan")))
-        fig_v.update_layout(title="Чувствительность к волатильности (Vega)", xaxis_title="IV %", height=300)
+        
+        fig_v = go.Figure()
+        fig_v.add_trace(go.Scatter(x=v_steps, y=v_probs, mode='lines+markers', line=dict(color='cyan')))
+        fig_v.add_vline(x=calc_dvol, line_dash="dot", annotation_text="Текущая IV")
+        fig_v.update_layout(height=350, title="Шанс выигрыша при изменении IV", xaxis_title="IV %")
         st.plotly_chart(fig_v, use_container_width=True)
+
+    # Резюме
+    with st.container(border=True):
+        st.markdown(f"""
+        ### 📋 Резюме стратегии
+        * **Матожидание:** {'✅ ПОЛОЖИТЕЛЬНОЕ' if edge > 0 else '⚠️ ОТРИЦАТЕЛЬНОЕ'}. Вы платите ${total_cost:.2f} за вероятность {prob*100:.1f}%.
+        * **Тета-эффект:** С каждым днем (при неизменной цене) ваша позиция прибавляет **~{((t_probs[1]-t_probs[0])/days_to_exp)*100:.2f}%** к вероятности успеха.
+        * **Концентрация OI:** В вашем диапазоне сосредоточено **{ (range_oi/total_oi*100) if total_oi>0 else 0:.1f}%** всей ликвидности экспирации.
+        * **Max Pain:** Уровень максимальной боли ${max_pain_val:,.0f} находится **{'ВНУТРИ' if p_low <= max_pain_val <= p_high else 'ВНЕ'}** вашего диапазона.
+        """)
+
+else:
+    st.warning("Загрузка данных из Deribit... Если это длится долго, проверьте подключение к API.")
