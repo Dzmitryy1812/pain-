@@ -4,15 +4,33 @@ import numpy as np
 import requests
 import math
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timezone
 from scipy.stats import norm
 
 # --- 1. НАСТРОЙКИ СТРАНИЦЫ ---
-st.set_page_config(page_title="BTC Entry Pro Calculator", layout="wide")
+st.set_page_config(page_title="BTC Alpha Terminal", layout="wide")
 
-# --- 2. ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ ---
+# --- 2. ФУНКЦИИ АПИ (DERIBIT) ---
 @st.cache_data(ttl=300)
-def get_deribit_data():
+def get_btc_price():
+    try:
+        url = "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd"
+        res = requests.get(url, timeout=10).json()
+        return float(res['result']['index_price'])
+    except: return 73500.0
+
+@st.cache_data(ttl=600)
+def get_live_dvol():
+    try:
+        # Получаем индекс волатильности (DVOL)
+        url = "https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1&start_timestamp="
+        res = requests.get(url, timeout=10).json()
+        # Берем последнее значение волатильности
+        return float(res['result']['data'][-1][1])
+    except: return 50.0
+
+@st.cache_data(ttl=300)
+def get_options_chain():
     try:
         url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
         res = requests.get(url, timeout=15).json()
@@ -29,168 +47,113 @@ def get_deribit_data():
         return pd.DataFrame(rows)
     except: return pd.DataFrame()
 
-def get_btc_price():
-    try:
-        url = "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd"
-        res = requests.get(url, timeout=10).json()
-        return float(res['result']['index_price'])
-    except: return 0.0
-
 # --- 3. ИНИЦИАЛИЗАЦИЯ ДАННЫХ ---
 price_now = get_btc_price()
-df_options = get_deribit_data()
+dvol_now = get_live_dvol()
+df_options = get_options_chain()
 
-st.title("🧮 Терминал оценки входа: Alpha Анализ")
-st.write(f"Последнее обновление цены: **${price_now:,.2f}**")
+st.title("🛡️ BTC Alpha Terminal: Анализ и Стоп-Лоссы")
+st.write(f"Цена: **${price_now:,.2f}** | Рыночный IV (DVOL): **{dvol_now:.2f}%**")
 
-# --- 4. БОКОВАЯ ПАНЕЛЬ И ВВОД ДАННЫХ ---
+# --- 4. ПАНЕЛЬ УПРАВЛЕНИЯ (SIDEBAR) ---
 with st.sidebar:
-    st.header("📋 Параметры сделки")
-    p_high = st.number_input("Верхний барьер (NO)", value=78000, step=500)
-    p_low = st.number_input("Нижний барьер (YES)", value=70000, step=500)
+    st.header("📋 Параметры Polymarket")
+    p_high = st.number_input("Верхний барьер (NO)", value=int(price_now + 4000), step=500)
+    p_low = st.number_input("Нижний барьер (YES)", value=int(price_now - 4000), step=500)
     st.divider()
-    polymarket_price = st.slider("Цена токена на Polymarket", 0.05, 0.99, 0.85, step=0.01)
-    bet_amount = st.number_input("Сумма ставки ($)", value=100)
+    poly_price = st.slider("Цена токена (Polymarket)", 0.05, 0.99, 0.85)
+    bet_size = st.number_input("Сумма входа ($)", value=100)
     st.divider()
-    custom_iv = st.slider("Ручной IV % (Волатильность)", 10, 150, 45)
+    # Возможность подправить IV вручную, если есть новости
+    iv_selected = st.slider("Рабочий IV %", 10, 150, int(dvol_now))
 
-col_main1, col_main2 = st.columns([2, 1])
-
-# --- 5. РАСЧЕТЫ (ENGINE) ---
+# --- 5. РАСЧЕТЫ ---
 if not df_options.empty:
     expiries = sorted(df_options['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
-    
-    with col_main1:
-        sel_exp = st.selectbox("📅 Выберите дату экспирации (соответствующую рынку):", expiries)
-    
-    # Расчет Max Pain и PCR
-    df_f = df_options[df_options['exp'] == sel_exp].copy()
-    strikes = np.sort(df_f['strike'].unique())
-    
-    pains = []
-    for s in strikes:
-        calls = df_f[df_f['type'] == 'C']
-        puts = df_f[df_f['type'] == 'P']
-        loss = np.sum(np.maximum(0, s - calls['strike']) * calls['oi']) + np.sum(np.maximum(0, puts['strike'] - s) * puts['oi'])
-        pains.append(loss)
-    
-    max_pain = float(strikes[np.argmin(pains)])
-    
-    put_oi = df_f[df_f['type'] == 'P']['oi'].sum()
-    call_oi = df_f[df_f['type'] == 'C']['oi'].sum()
-    pcr = put_oi / call_oi if call_oi > 0 else 0
+    sel_exp = st.selectbox("📅 Дата экспирации (выбрать на основе рынка):", expiries)
     
     # Расчет времени
-    exp_dt = datetime.strptime(sel_exp, "%d%b%y")
-    days_to_expiry = max((exp_dt - datetime.utcnow()).days + (exp_dt - datetime.utcnow()).seconds/86400, 0.1)
-    t_years = days_to_expiry / 365
+    exp_dt = datetime.strptime(sel_exp, "%d%b%y").replace(tzinfo=timezone.utc)
+    now_dt = datetime.now(timezone.utc)
+    days_left = max((exp_dt - now_dt).total_seconds() / 86400, 0.1)
+    t_years = days_left / 365
 
-    # Математическое ожидание движения (Expected Move)
-    # Используем формулу стандартного отклонения
-    stdev = (custom_iv / 100) * math.sqrt(t_years)
-    upper_1s = price_now * (1 + stdev)
-    lower_1s = price_now * (1 - stdev)
-    upper_2s = price_now * (1 + 2*stdev)
-    lower_2s = price_now * (1 - 2*stdev)
+    # Max Pain и PCR
+    df_f = df_options[df_options['exp'] == sel_exp]
+    strikes = np.sort(df_f['strike'].unique())
+    pains = []
+    for s in strikes:
+        c = df_f[df_f['type'] == 'C']; p = df_f[df_f['type'] == 'P']
+        loss = np.sum(np.maximum(0, s - c['strike']) * c['oi']) + np.sum(np.maximum(0, p['strike'] - s) * p['oi'])
+        pains.append(loss)
+    max_pain = float(strikes[np.argmin(pains)])
+    pcr = df_f[df_f['type'] == 'P']['oi'].sum() / df_f[df_f['type'] == 'C']['oi'].sum()
 
-    # РАСЧЕТ МАТЕМАТИЧЕСКОГО ПРЕИМУЩЕСТВА (EDGE)
-    # Вероятность того, что цена НЕ дойдет до верхнего барьера (аналитическое приближение)
-    d2_upper = (math.log(p_high / price_now) - (0.5 * (custom_iv/100)**2) * t_years) / ((custom_iv/100) * math.sqrt(t_years))
-    prob_not_breach_upper = norm.cdf(d2_upper) 
+    # Математика волатильности
+    z_score_1 = 1.0; z_score_2 = 2.0
+    std_dev = (iv_selected / 100) * math.sqrt(t_years)
     
-    # Справедливая цена токена на основе мат. ожидания
-    fair_price = prob_not_breach_upper 
-    edge = fair_price - polymarket_price
-
-    # --- 6. ВИЗУАЛИЗАЦИЯ И ДАШБОРД ---
+    upper_1s = price_now * (1 + std_dev); lower_1s = price_now * (1 - std_dev)
+    upper_2s = price_now * (1 + 2 * std_dev); lower_2s = price_now * (1 - 2 * std_dev)
     
-    with col_main1:
-        # ГРАФИК КАРТЫ ПОЗИЦИИ
-        fig = go.Figure()
-        # Линия текущей цены
-        fig.add_vline(x=price_now, line_width=3, line_color="white", annotation_text="PRICE", annotation_position="top")
-        # Барьеры
-        fig.add_vrect(x0=p_low, x1=p_high, fillcolor="green", opacity=0.1, line_width=0, annotation_text="ВАША ЗОНА ПРИБЫЛИ")
-        fig.add_vline(x=p_low, line_dash="dash", line_color="cyan", annotation_text="YES Barrier")
-        fig.add_vline(x=p_high, line_dash="dash", line_color="orange", annotation_text="NO Barrier")
-        # Max Pain
-        fig.add_vline(x=max_pain, line_color="red", line_dash="dot", annotation_text="MAX PAIN (Магнит)")
-        
-        fig.update_layout(title="Карта рисков и Магнитов рынка", template="plotly_dark", height=300, 
-                          xaxis=dict(range=[min(p_low, lower_2s)*0.98, max(p_high, upper_2s)*1.02]))
-        st.plotly_chart(fig, use_container_width=True)
+    # Стоп-лосс на уровне 1.25 сигмы
+    sl_upper = price_now * (1 + 1.25 * std_dev)
+    sl_lower = price_now * (1 - 1.25 * std_dev)
 
-        # Метрики прибыли
-        c_p1, c_p2, c_p3, c_p4 = st.columns(4)
-        profit_raw = (bet_amount / polymarket_price) - bet_amount
-        c_p1.metric("Прибыль $", f"${profit_raw:,.1f}")
-        c_p2.metric("ROI", f"{(profit_raw/bet_amount*100):.1f}%")
-        c_p3.metric("Вероятность (Math)", f"{(fair_price*100):.1f}%")
-        
-        edge_color = "normal" if edge < 0 else "inverse"
-        c_p4.metric("Мат. Преимущество", f"{edge*100:+.1f}%", delta_color=edge_color)
+    # Вероятность успеха (Edge)
+    d2 = (math.log(p_high / price_now) - (0.5 * (iv_selected/100)**2) * t_years) / ((iv_selected/100) * math.sqrt(t_years))
+    prob_success = norm.cdf(d2)
+    edge = prob_success - poly_price
 
-    with col_main2:
-        st.subheader("🕵️ Сентимент")
-        st.write(f"**PCR Ratio:** `{pcr:.2f}`")
-        if pcr > 1.1: st.warning("🐻 Рынок страхуется от падения (много Путов)")
-        elif pcr < 0.7: st.success("🐂 Рынок уверен в росте (много Коллов)")
-        else: st.info("⚖️ Нейтральный баланс сил")
-        
-        st.divider()
-        st.subheader("📐 Зоны риска (IV)")
-        st.write(f"1σ (68%): `${lower_1s:,.0f} - ${upper_1s:,.0f}`")
-        st.write(f"2σ (95%): `${lower_2s:,.0f} - ${upper_2s:,.0f}`")
-        
-        dist_to_pain = (max_pain / price_now - 1) * 100
-        st.write(f"**Тяга к Max Pain:** `{dist_to_pain:+.1f}%`")
+    # --- 6. ДАШБОРД МЕТРИК ---
+    m1, m2, m3, m4 = st.columns(4)
+    profit = (bet_size / poly_price) - bet_size
+    m1.metric("Прибыль", f"${profit:,.1f}")
+    m2.metric("ROI в день", f"{(profit/bet_size*100/days_left):.1f}%")
+    m3.metric("Шанс Math", f"{prob_success*100:.1f}%")
+    m4.metric("Мат. преимущество", f"{edge*100:+.1f}%")
 
-    # --- 7. ФИНАЛЬНЫЙ ВЕРДИКТ ---
+    # --- 7. ГРАФИК ---
+    fig = go.Figure()
+    # Зоны
+    fig.add_vrect(x0=lower_1s, x1=upper_1s, fillcolor="blue", opacity=0.1, line_width=0, name="1 Sigma")
+    # Линии
+    fig.add_vline(x=price_now, line_width=3, line_color="white", annotation_text="ЦЕНА")
+    fig.add_vline(x=p_high, line_dash="dash", line_color="orange", annotation_text="БАРЬЕР NO")
+    fig.add_vline(x=p_low, line_dash="dash", line_color="cyan", annotation_text="БАРЬЕР YES")
+    fig.add_vline(x=max_pain, line_dash="dot", line_color="red", annotation_text="MAX PAIN")
+    # Стоп-лоссы
+    fig.add_vline(x=sl_upper, line_dash="dashdot", line_color="yellow", annotation_text="STOP LOSS")
+    fig.add_vline(x=sl_lower, line_dash="dashdot", line_color="yellow")
+
+    fig.update_layout(template="plotly_dark", height=400, title="Визуализация рисков и Стоп-лоссов")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # --- 8. АНАЛИЗ И СТОП-ЛОССЫ ---
     st.divider()
-    st.subheader("💡 Итоговое заключение по позиции:")
-    
-    verdict_col1, verdict_col2 = st.columns([3, 1])
-    
-    with verdict_col1:
-        score = 0
-        reasons = []
-        
-        # Проверка IV барьеров
-        if p_high > upper_1s: 
-            score += 1
-            reasons.append("✅ Верхний барьер вне зоны основной волатильности (1 сигма).")
-        else:
-            reasons.append("🚨 ОПАСНО: Верхний барьер может быть легко достигнут при текущем IV.")
-            
-        if p_low < lower_1s:
-            score += 1
-            reasons.append("✅ Нижний барьер в зоне относительной безопасности.")
-        
-        # Проверка Max Pain
-        if p_low < max_pain < p_high:
-            score += 1
-            reasons.append(f"✅ Max Pain (${max_pain:,.0f}) находится внутри вашего коридора. Это будет удерживать цену.")
-        
-        # Проверка Edge
-        if edge > 0.05:
-            score += 1
-            reasons.append(f"✅ Цена на Polymarket ({polymarket_price}) ниже математической вероятности ({fair_price:.2f}). Это выгодная ставка.")
-        elif edge < -0.05:
-            reasons.append(f"❌ Переплата: Вы покупаете риск слишком дорого. Математика дает меньший шанс успеха.")
+    c_inf1, c_inf2 = st.columns(2)
 
-        for r in reasons:
-            st.write(r)
+    with c_inf1:
+        st.subheader("🛑 Твои Стоп-Лоссы (Выход)")
+        st.error(f"**ВЕРХНИЙ СТОП:** `${sl_upper:,.0f}`")
+        st.error(f"**НИЖНИЙ СТОП:** `${sl_lower:,.0f}`")
+        st.write("Если цена BTC касается этих уровней, вероятность победы падает ниже 40%. Рекомендуется закрыть позицию вручную.")
 
-    with verdict_col2:
-        if score >= 3:
-            st.success("💎 СДЕЛКА: КЛАСС А")
-            st.write("Высокое мат. преимущество.")
-        elif score == 2:
-            st.warning("⚠️ СДЕЛКА: КЛАСС B")
-            st.write("Есть риски, но профит оправдан.")
-        else:
-            st.error("🚫 СДЕЛКА: КЛАСС C")
-            st.write("Математика против этой позиции.")
+    with c_inf2:
+        st.subheader("🧭 Сентимент рынка")
+        st.write(f"**Put/Call Ratio:** `{pcr:.2f}`")
+        st.write(f"**Тяга к Max Pain:** `{(max_pain/price_now-1)*100:+.1f}%`")
+        if pcr > 1.1: st.write("🐻 Рынок боится падения.")
+        elif pcr < 0.7: st.write("🐂 Рынок ждет только роста.")
+        
+    # --- 9. ВЕРДИКТ ---
+    st.divider()
+    if p_high > upper_1s and p_low < lower_1s and edge > 0:
+        st.success("💎 СДЕЛКА КЛАССА A: Математика, IV и уровни полностью на вашей стороне.")
+    elif p_high > upper_1s and p_low < lower_1s:
+        st.info("🟡 СДЕЛКА КЛАССА B: Математически безопасно, но преимущество (Edge) невелико.")
+    else:
+        st.error("🚨 СДЕЛКА КЛАССА C: Высокий риск пробития барьера по волатильности.")
 
 else:
-    st.error("Не удалось получить данные от API. Пожалуйста, попробуйте позже.")
+    st.error("Данные Deribit временно недоступны.")
