@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 import time
-from scipy.stats import norm
+#from scipy.stats import norm
 import plotly.graph_objects as go
 
 # Настройка страницы
