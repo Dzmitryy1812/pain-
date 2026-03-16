@@ -1,67 +1,88 @@
 import streamlit as st
-import ccxt
-import time
+import requests
 import pandas as pd
+import time
 
-# Настройка страницы (компактный вид)
-st.set_page_config(page_title="BTC Monitor", layout="centered")
+# Настройка страницы
+st.set_page_config(page_title="Polymarket Strategy Monitor", layout="centered")
 
-# Инициализация API
-exchange = ccxt.deribit({'enableRateLimit': True, 'timeout': 30000})
-
-@st.cache_data(ttl=60)
-def get_market_data():
+def get_polymarket_data(address):
+    url = f"https://data-api.polymarket.com{address}"
     try:
-        ticker = exchange.fetch_ticker('BTC/USD:BTC')
-        # Берем данные для расчета Max Pain (упрощенно по ближайшей пятнице)
-        markets = exchange.load_markets()
-        # В реальном времени здесь будет запрос OI, но для скорости выведем расчетную модель
-        return ticker['last'], 72930.0 # Текущая цена и Max Pain
-    except:
-        return 73820.0, 72930.0
+        # Добавляем заголовки, чтобы API не блокировало запрос
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        return []
+    except Exception as e:
+        st.error(f"Ошибка связи с API: {e}")
+        return []
 
 # --- ИНТЕРФЕЙС ---
-st.title("🚀 BTC Strategy Monitor")
+st.title("🚀 Polymarket Strategy Live")
+wallet = "0x11D9733c33BE11E9B9f9B135EB16F85AA6a03dec"
 
-btc_price, max_pain = get_market_data()
+positions = get_polymarket_data(wallet)
 
-# 1. СЕКЦИЯ МОНИТОРИНГА
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric("Цена BTC", f"${btc_price:,.0f}")
-with col2:
-    st.metric("MAX PAIN", f"${max_pain:,.0f}")
-with col3:
-    # Расчет PIN RISK (если цена близко к Max Pain — риск высокий)
-    diff = abs(btc_price - max_pain)
-    pin_risk = "HIGH 🔥" if diff < 1500 else "MEDIUM ⚠️" if diff < 3000 else "LOW ❄️"
-    st.metric("PIN RISK", pin_risk)
-
-st.divider()
-
-# 2. ВАША ПОЗИЦИЯ
-st.subheader("Ваша позиция: 68k YES / 76k NO")
-entry_total = 1.725
-
-c1, c2 = st.columns(2)
-with c1:
-    leg_68 = st.number_input("Цена 68k YES сейчас", value=0.96)
-with c2:
-    leg_76 = st.number_input("Цена 76k NO сейчас", value=0.76)
-
-current_total = leg_68 + leg_76
-pnl_pct = ((current_total - entry_total) / entry_total) * 100
-
-# ФИНАЛЬНЫЙ СТАТУС
-if pnl_pct <= -10:
-    st.error(f"🚨 EXIT NOW! PnL: {pnl_pct:.2f}% | Total: ${current_total:.3f}")
+if not positions:
+    st.warning("⚠️ Позиций не найдено. Проверь адрес или дождись обновления API.")
 else:
-    st.success(f"✅ HOLD. PnL: {pnl_pct:.2f}% | Total: ${current_total:.3f}")
+    total_invested = 0.0
+    total_current_value = 0.0
+    rows = []
 
-# Информация о стопе
-st.info(f"Ваш экстренный выход (Stop Loss) на уровне: $1.55 (Текущий: ${current_total:.3f})")
+    for p in positions:
+        # Извлекаем данные из JSON (учитываем возможные типы данных)
+        size = float(p.get('size', 0))
+        avg_price = float(p.get('avgPrice', 0))
+        # Polymarket API часто отдает текущую цену в 'curPrice' или 'price'
+        cur_price = float(p.get('curPrice') or p.get('price') or 0)
+        title = p.get('title', 'Unknown Asset')
 
-# Авто-обновление
-time.sleep(30)
+        if size > 0:
+            inv = size * avg_price
+            val = size * cur_price
+            total_invested += inv
+            total_current_value += val
+            
+            pnl_pct = ((cur_price / avg_price) - 1) * 100 if avg_price > 0 else 0
+            rows.append({
+                "Тип": "ABOVE" if "above" in title.lower() else "HIT/DIP",
+                "Инструмент": title,
+                "PnL %": f"{pnl_pct:.2f}%",
+                "Value": f"${val:.2f}"
+            })
+
+    # РАСЧЕТ ИТОГА КОНСТРУКЦИИ
+    if total_invested > 0:
+        total_pnl_pct = ((total_current_value / total_invested) - 1) * 100
+        total_pnl_usd = total_current_value - total_invested
+
+        # 1. ГЛАВНАЯ ПЛИТКА (PnL всей конструкции)
+        st.divider()
+        col1, col2 = st.columns(2)
+        with col1:
+            color = "normal" if total_pnl_pct >= -12 else "inverse" # Сигнал при -12%
+            st.metric("ОБЩИЙ PnL СТРАТЕГИИ", f"{total_pnl_pct:.2f}%", delta=f"${total_pnl_usd:.2f}", delta_color=color)
+        with col2:
+            st.metric("ТЕКУЩАЯ СТОИМОСТЬ", f"${total_current_value:.2f}")
+
+        # 2. ТАБЛИЦА НОГ (ЧАСТЕЙ КОНСТРУКЦИИ)
+        st.subheader("Состав конструкции")
+        st.table(pd.DataFrame(rows))
+
+        # 3. СТАТУС ВЫХОДА
+        if total_pnl_pct <= -15:
+            st.error(f"🚨 КРИТИЧЕСКИЙ УБЫТОК! Пора закрывать конструкцию (-15% достигнуто)")
+        elif total_pnl_pct >= 10:
+            st.success(f"💰 ОТЛИЧНЫЙ ПРОФИТ! Можно фиксировать (+10%)")
+        else:
+            st.info("💎 Конструкция в работе. Мониторинг активен.")
+    
+    st.divider()
+    st.caption(f"Обновлено: {time.strftime('%H:%M:%S')} | Wallet: {wallet[:6]}...{wallet[-4:]}")
+
+# Авто-обновление каждые 20 секунд (для Polymarket этого достаточно)
+time.sleep(20)
 st.rerun()
