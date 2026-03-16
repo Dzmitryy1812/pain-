@@ -12,16 +12,38 @@ from scipy.stats import norm
 st.set_page_config(page_title="BTC Alpha Terminal v4.8", layout="wide")
 
 # (Функции get_market_data, get_options_book и calculate_pains остаются без изменений)
+def get_stable_price():
+    # Список источников в порядке приоритета
+    sources = [
+        {"name": "Binance", "url": "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", "path": ["price"]},
+        {"name": "Coinbase", "url": "https://api.coinbase.com/v2/prices/BTC-USD/spot", "path": ["data", "amount"]},
+        {"name": "Kraken", "url": "https://api.kraken.com/0/public/Ticker?pair=XBTUSD", "path": ["result", "XXBTZUSD", "c", 0]}
+    ]
+    
+    for src in sources:
+        try:
+            res = requests.get(src['url'], timeout=3).json()
+            # Динамическое извлечение данных по пути
+            val = res
+            for key in src['path']:
+                val = val[key]
+            return float(val), src['name']
+        except:
+            continue
+    return 70000.0, "Error"
+
 @st.cache_data(ttl=60)
 def get_market_data():
+    price, source_name = get_stable_price()
+    
+    # DVOL лучше брать с Deribit, так как это их индекс
     try:
-        p_res = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", timeout=5).json()
-        price = float(p_res['result']['index_price'])
         v_res = requests.get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1", timeout=5).json()
         dvol = float(v_res['result']['data'][-1][3])
-        return price, dvol, datetime.now().strftime("%H:%M:%S")
     except:
-        return 70000.0, 55.0, "API Error"
+        dvol = 55.0
+        
+    return price, dvol, datetime.now().strftime("%H:%M:%S")
 
 @st.cache_data(ttl=300)
 def get_options_book():
