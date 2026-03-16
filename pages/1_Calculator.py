@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from scipy.stats import norm
 
 # --- 1. CONFIG ---
-st.set_page_config(page_title="BTC Alpha Terminal v4.6", layout="wide")
+st.set_page_config(page_title="BTC Alpha Terminal v4.7", layout="wide")
 
 # --- 2. DATA SOURCE ---
 @st.cache_data(ttl=60)
@@ -41,11 +41,12 @@ def get_options_book():
 
 # --- 3. MATH ---
 def calculate_pains(df):
-    if df.empty: return 0, [], []
+    if df.empty: return 0.0, [], []
     strikes = sorted(df['strike'].unique())
     calls = df[df['type'] == 'C'].groupby('strike')['oi'].sum().reindex(strikes, fill_value=0).values
     puts = df[df['type'] == 'P'].groupby('strike')['oi'].sum().reindex(strikes, fill_value=0).values
-    pains = [np.sum(np.maximum(0, s - np.array(strikes)) * calls) + np.sum(np.maximum(0, np.array(strikes) - s) * puts) for s in strikes]
+    strike_vals = np.array(strikes)
+    pains = [np.sum(np.maximum(0, s - strike_vals) * calls) + np.sum(np.maximum(0, strike_vals - s) * puts) for s in strikes]
     return float(strikes[np.argmin(pains)]), strikes, pains
 
 # --- 4. SIDEBAR ---
@@ -66,15 +67,13 @@ with st.sidebar:
     st.divider()
     st.markdown("### 🎯 Настройка сделки")
     
-    # НИЖНИЙ БАРЬЕР (YES)
     p_low = st.number_input("Нижний барьер ($)", value=int((calc_price//1000 - 5)*1000), step=1000)
-    poly_low_yes_px = st.slider("Цена YES (Stay Above)", 0.01, 0.99, 0.85, help="Цена 'YES' за то, что цена будет ВЫШЕ нижнего барьера")
+    poly_low_yes_px = st.slider("Цена YES (Stay Above)", 0.01, 0.99, 0.85)
     
     st.markdown("---")
     
-    # ВЕРХНИЙ БАРЬЕР (NO)
     p_high = st.number_input("Верхний барьер ($)", value=int((calc_price//1000 + 5)*1000), step=1000)
-    poly_high_no_px = st.slider("Цена NO (Not Reach High)", 0.01, 0.99, 0.85, help="Цена 'NO' в событии 'Will BTC hit...'. Выигрывает, если НЕ дойдет до верха.")
+    poly_high_no_px = st.slider("Цена NO (Not Reach High)", 0.01, 0.99, 0.85)
 
     if not df_all.empty:
         exps = sorted(list(df_all['exp'].unique()), key=lambda x: datetime.strptime(x, "%d%b%y"))
@@ -93,72 +92,52 @@ if not df_all.empty and sel_exp != "N/A":
     
     std = (calc_dvol / 100) * math.sqrt(t_y)
     
-    # Вероятность оказаться НИЖЕ барьеров
     prob_below_low = norm.cdf((math.log(p_low/calc_price) + 0.5*std**2)/std)
     prob_below_high = norm.cdf((math.log(p_high/calc_price) + 0.5*std**2)/std)
     
-    # === ЛОГИКА EDGE ===
-    # 1. Шанс, что цена будет ВЫШЕ нижнего порога (Твой YES)
     math_prob_stay_above = 1 - prob_below_low
-    edge_low = math_prob_stay_above - poly_low_yes_px
-    
-    # 2. Шанс, что цена будет НИЖЕ верхнего порога (Твой NO)
     math_prob_stay_below = prob_below_high
+    
+    edge_low = math_prob_stay_above - poly_low_yes_px
     edge_high = math_prob_stay_below - poly_high_no_px
     
-    # 3. Общая вероятность диапазона
     prob_inside = prob_below_high - prob_below_low
 
     # --- 6. UI ---
-    st.title("🛡️ BTC Alpha Terminal v4.6")
+    st.title("🛡️ BTC Alpha Terminal v4.7")
     
     c1, c2, c3 = st.columns(3)
-    
-    with c1:
-        st.subheader("📉 Нижний (YES)")
-        st.caption(f"Событие: BTC > ${p_low:,.0f}")
-        st.metric("Model Prob", f"{math_prob_stay_above*100:.1f}%")
-        st.metric("Edge", f"{edge_low*100:+.1f}%", delta=f"{edge_low*100:.1f}%")
-        
-    with c2:
-        st.subheader("📈 Верхний (NO/Stay Below)")
-        st.caption(f"Событие: BTC < ${p_high:,.0f}")
-        st.metric("Model Prob", f"{math_prob_stay_below*100:.1f}%")
-        st.metric("Edge", f"{edge_high*100:+.1f}%", delta=f"{edge_high*100:.1f}%")
-        
-    with c3:
-        st.subheader("🎯 Общий диапазон")
-        st.metric("Prob Inside", f"{prob_inside*100:.1f}%")
-        st.metric("Max Pain", f"${max_pain_val:,.0f}")
-
-    # Блок стратегии
-    st.divider()
-    with st.container(border=True):
-        st.subheader("📝 Резюме рынков")
-        
-        # Анализ выгодности
-        low_verdict = "✅ ВЫГОДНО покупать YES" if edge_low > 0.02 else "❌ ДОРОГОЙ YES"
-        high_verdict = "✅ ВЫГОДНО покупать NO" if edge_high > 0.02 else "❌ ДОРОГОЙ NO"
-        
-        r1, r2 = st.columns(2)
-        r1.info(f"**Нижний барьер:** {low_verdict} (Превосходство модели: {edge_low*100:.1f}%)")
-        r2.info(f"**Верхний барьер:** {high_verdict} (Превосходство модели: {edge_high*100:.1f}%)")
+    c1.metric("Нижний (BTC > Low)", f"{math_prob_stay_above*100:.1f}%", f"Edge: {edge_low*100:+.1f}%")
+    c2.metric("Верхний (BTC < High)", f"{math_prob_stay_below*100:.1f}%", f"Edge: {edge_high*100:+.1f}%")
+    c3.metric("Inside Range", f"{prob_inside*100:.1f}%", f"Pain: ${max_pain_val:,.0f}")
 
     # ГРАФИК
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     oi_data = df.groupby('strike')['oi'].sum().reset_index()
     
-    fig.add_trace(go.Bar(
-        x=oi_data['strike'], y=oi_data['oi'], name="Open Interest", 
-        marker=dict(color='lightgrey'), secondary_y=False
-    ))
+    # ИСПРАВЛЕННЫЙ БЛОК ТРАСС
+    fig.add_trace(
+        go.Bar(
+            x=oi_data['strike'], 
+            y=oi_data['oi'], 
+            name="Open Interest", 
+            marker=dict(color='rgba(150, 150, 150, 0.5)')
+        ),
+        secondary_y=False  # Параметр ВНУТРИ add_trace, а не внутри go.Bar
+    )
 
-    fig.add_trace(go.Scatter(
-        x=strikes_v, y=pains_v, name="MM Pain Curve", 
-        line=dict(color='royalblue', width=3), secondary_y=True
-    ))
+    fig.add_trace(
+        go.Scatter(
+            x=strikes_v, 
+            y=pains_v, 
+            name="MM Pain Curve", 
+            line=dict(color='royalblue', width=3)
+        ),
+        secondary_y=True
+    )
 
-    fig.add_vrect(x0=p_low, x1=p_high, fillcolor="rgba(0, 255, 0, 0.05)", line_width=0, annotation_text="БЕЗОПАСНАЯ ЗОНА")
+    # Визуализация зон
+    fig.add_vrect(x0=p_low, x1=p_high, fillcolor="rgba(0, 255, 0, 0.05)", line_width=0)
     fig.add_vline(x=calc_price, line_color="black", line_width=2, annotation_text="SPOT")
     fig.add_vline(x=max_pain_val, line_color="orange", line_dash="dot", annotation_text="MAX PAIN")
 
@@ -166,7 +145,11 @@ if not df_all.empty and sel_exp != "N/A":
         height=600, template="plotly_white",
         xaxis=dict(range=[calc_price*0.7, calc_price*1.3], title="BTC Price"),
         yaxis=dict(title="OI (BTC)"),
-        legend=dict(orientation="h", y=1.1)
+        yaxis2=dict(title="MM Loss/Pain", overlaying='y', side='right'),
+        legend=dict(orientation="h", y=1.1, x=0.5, xanchor="center")
     )
     
     st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.info("Ожидание данных или выбор экспирации...")
