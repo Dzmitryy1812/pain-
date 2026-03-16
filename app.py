@@ -2,111 +2,117 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
+from scipy.stats import norm
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Real Max Pain [Deribit]", layout="wide")
+st.set_page_config(page_title="Advanced Max Pain & GEX", layout="wide")
 
-# Заголовки для обхода блокировок Cloudflare/Deribit
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Accept': 'application/json'
-}
+# --- КОНСТАНТЫ И НАСТРОЙКИ (из Pine Script) ---
+st.sidebar.header("Параметры модели")
+IV = st.sidebar.slider("Implied Volatility (IV) %", 10, 150, 50) / 100
+STRIKE_RANGE_PCT = st.sidebar.slider("Диапазон цен (Strike Range) %", 5, 50, 20)
 
-@st.cache_data(ttl=300) 
-def get_deribit_options_data():
+HEADERS = {'User-Agent': 'Mozilla/5.0'}
+
+@st.cache_data(ttl=60)
+def get_deribit_data(currency="BTC"):
     try:
-        url = "https://www.deribit.com"
-        # Добавляем headers в запрос
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        
-        if response.status_code != 200:
-            st.error(f"Биржа отклонила запрос (Код {response.status_code}). Попробуйте позже.")
-            return pd.DataFrame()
-            
-        result = response.json().get('result', [])
-        rows = []
-        
-        for item in result:
-            name = item['instrument_name'] # BTC-27MAR26-70000-C
-            parts = name.split('-')
-            if len(parts) >= 4:
-                try:
-                    rows.append({
-                        'strike': float(parts[2]),
-                        'type': parts[3], # C или P
-                        'oi': float(item['open_interest'])
-                    })
-                except: continue
-        
-        return pd.DataFrame(rows)
-    except Exception as e:
-        st.error(f"Ошибка соединения: {e}")
-        return pd.DataFrame()
+        url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={currency}&kind=option"
+        res = requests.get(url, headers=HEADERS).json()
+        df = pd.DataFrame([
+            {
+                'expiry': x['instrument_name'].split('-')[1],
+                'strike': float(x['instrument_name'].split('-')[2]),
+                'type': x['instrument_name'].split('-')[3],
+                'oi': float(x.get('open_interest', 0))
+            } for x in res['result']
+        ])
+        return df
+    except: return pd.DataFrame()
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=30)
 def get_btc_price():
-    try:
-        url = "https://www.deribit.com"
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        return float(response.json()['result']['index_price'])
-    except:
-        # Запасной вариант через CryptoCompare если Deribit блокирует
-        try:
-            res = requests.get("https://min-api.cryptocompare.com", timeout=5)
-            return float(res.json()['USD'])
-        except:
-            return 0.0
+    url = "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd"
+    return requests.get(url, headers=HEADERS).json()['result']['index_price']
 
-# --- РАСЧЕТ ---
-def calculate_real_max_pain(df):
+# --- МАТЕМАТИКА GREEKS (из Pine Script logic) ---
+def calculate_gamma(S, K, T, sigma):
+    if T <= 0 or sigma <= 0: return 0
+    d1 = (np.log(S/K) + (0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    gamma = np.exp(-0.5 * d1**2) / (S * sigma * np.sqrt(2 * np.pi * T))
+    return gamma
+
+# --- РАСЧЕТ MAX PAIN ---
+def calculate_metrics(df, spot_price):
     unique_strikes = np.sort(df['strike'].unique())
-    # Фильтруем страйки для ускорения, берем только те, где есть OI
-    pains = []
+    # Фильтруем страйки вокруг цены как в TW
+    min_s = spot_price * (1 - STRIKE_RANGE_PCT/100)
+    max_s = spot_price * (1 + STRIKE_RANGE_PCT/100)
+    unique_strikes = unique_strikes[(unique_strikes >= min_s) & (unique_strikes <= max_s)]
     
-    # Считаем боль для каждого страйка
-    for test_strike in unique_strikes:
+    pains = []
+    gex_list = []
+    
+    # Расчет T (дни до экспирации - упрощенно 7 дней как в вашем конфиге TW)
+    T = 7 / 365 
+    
+    for test_s in unique_strikes:
+        # 1. Max Pain (Intrinsic Value)
         calls = df[df['type'] == 'C']
         puts = df[df['type'] == 'P']
+        # Убыток продавцов: Call давит если цена выше, Put если ниже
+        c_loss = np.sum(np.maximum(0, test_s - calls['strike']) * calls['oi'])
+        p_loss = np.sum(np.maximum(0, puts['strike'] - test_s) * puts['oi'])
+        pains.append(c_loss + p_loss)
         
-        c_pain = np.sum(np.maximum(0, test_strike - calls['strike']) * calls['oi'])
-        p_pain = np.sum(np.maximum(0, puts['strike'] - test_strike) * puts['oi'])
-        pains.append(c_pain + p_pain)
+        # 2. Gamma Exposure (GEX)
+        # GEX = (Call OI - Put OI) * Gamma * Spot * 0.01 (стандартный подход)
+        strike_df = df[df['strike'] == test_s]
+        c_oi = strike_df[strike_df['type'] == 'C']['oi'].sum()
+        p_oi = strike_df[strike_df['type'] == 'P']['oi'].sum()
+        
+        gamma = calculate_gamma(spot_price, test_s, T, IV)
+        gex = (c_oi - p_oi) * gamma * (spot_price**2) * 0.01
+        gex_list.append(gex)
+
+    return unique_strikes, pains, gex_list
+
+# --- UI ---
+st.title("🎯 Advanced BTC Max Pain & Gamma Exposure")
+
+spot = get_btc_price()
+df_all = get_deribit_data()
+
+if not df_all.empty:
+    expiries = sorted(df_all['expiry'].unique())
+    selected_exp = st.selectbox("Экспирация", expiries)
+    df_filtered = df_all[df_all['expiry'] == selected_exp]
     
-    max_pain_price = unique_strikes[np.argmin(pains)]
-    return max_pain_price, unique_strikes, pains
-
-# --- ИНТЕРФЕЙС ---
-st.title("🎯 Real BTC Max Pain (Deribit API)")
-
-price = get_btc_price()
-df_options = get_deribit_options_data()
-
-if not df_options.empty and price > 0:
-    real_max_pain, all_strikes, all_pains = calculate_real_max_pain(df_options)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("BTC INDEX", f"${price:,.2f}")
-    with c2:
-        st.metric("REAL MAX PAIN", f"${real_max_pain:,.0f}")
-    with c3:
-        diff = price - real_max_pain
-        st.metric("ОТКЛОНЕНИЕ", f"${diff:,.0f}", delta=f"{(diff/real_max_pain*100):.2f}%", delta_color="inverse")
-
-    st.divider()
+    strikes, pains, gex = calculate_metrics(df_filtered, spot)
+    max_pain_val = strikes[np.argmin(pains)]
     
-    chart_df = pd.DataFrame({'Pain': all_pains}, index=all_strikes)
-    # Показываем только актуальный диапазон вокруг цены
-    view = chart_df[(chart_df.index > price * 0.4) & (chart_df.index < price * 1.6)]
-    st.area_chart(view, color="#00ffcc")
-    
-    st.info(f"Анализ завершен. Найдено {len(df_options)} активных контрактов.")
+    # Метрики
+    cols = st.columns(3)
+    cols[0].metric("BTC Price", f"${spot:,.2f}")
+    cols[1].metric("Max Pain", f"${max_pain_val:,.0f}")
+    cols[2].metric("Distance", f"{((max_pain_val-spot)/spot*100):.2f}%")
+
+    # График Gamma Exposure (как в Pine Script)
+    st.subheader("Gamma Exposure Profile (GEX)")
+    fig_gex = go.Figure()
+    colors = ['red' if x < 0 else 'green' for x in gex]
+    fig_gex.add_trace(go.Bar(x=strikes, y=gex, marker_color=colors))
+    fig_gex.add_vline(x=spot, line_dash="dash", line_color="yellow", annotation_text="SPOT")
+    fig_gex.update_layout(template="plotly_dark", height=400)
+    st.plotly_chart(fig_gex, use_container_width=True)
+
+    # График Max Pain (Heatmap logic)
+    st.subheader("Pain Heatmap")
+    fig_pain = go.Figure()
+    fig_pain.add_trace(go.Scatter(x=strikes, y=pains, fill='tozeroy', line_color='cyan'))
+    fig_pain.add_vline(x=max_pain_val, line_color="red", width=3, annotation_text="MAX PAIN")
+    fig_pain.update_layout(template="plotly_dark", height=400)
+    st.plotly_chart(fig_pain, use_container_width=True)
+
 else:
-    st.warning("🔄 Ожидание ответа от Deribit API... Попробуйте обновить страницу через 10 секунд.")
-    if st.button("Обновить принудительно"):
-        st.rerun()
-
-st.caption(f"Обновлено: {time.strftime('%H:%M:%S')} UTC")
-
-time.sleep(60)
-st.rerun()
+    st.error("Ошибка загрузки данных")
