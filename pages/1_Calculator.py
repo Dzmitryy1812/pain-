@@ -1,10 +1,14 @@
 import streamlit as st
+import pandas as pd
+import numpy as np
 import requests
 import math
-import pandas as pd
 from datetime import datetime
 
-# --- 1. ФУНКЦИИ ДАННЫХ ---
+# --- 1. КОНФИГУРАЦИЯ СТРАНИЦЫ ---
+st.set_page_config(page_title="Entry Calculator Pro", layout="wide")
+
+# --- 2. ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ ---
 @st.cache_data(ttl=300)
 def get_deribit_data():
     try:
@@ -14,9 +18,16 @@ def get_deribit_data():
         for x in res.get('result', []):
             parts = x['instrument_name'].split('-')
             if len(parts) >= 4:
-                rows.append({'exp': parts[1], 'strike': float(parts[2]), 'type': parts[3], 'oi': float(x.get('open_interest', 0))})
+                rows.append({
+                    'exp': parts[1], 
+                    'strike': float(parts[2]), 
+                    'type': parts[3], 
+                    'oi': float(x.get('open_interest', 0))
+                })
         return pd.DataFrame(rows)
-    except: return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Ошибка API Deribit: {e}")
+        return pd.DataFrame()
 
 def get_btc_price():
     try:
@@ -25,99 +36,118 @@ def get_btc_price():
         return float(res['result']['index_price'])
     except: return 0.0
 
-# --- 2. ИНТЕРФЕЙС ---
-st.set_page_config(page_title="Pro Calculator", layout="wide")
+# --- 3. ИНТЕРФЕЙС ---
 st.title("🧮 Калькулятор: Волатильность + Max Pain")
+st.write("Комплексная проверка входа на Polymarket")
 
 price_now = get_btc_price()
 df_options = get_deribit_data()
 
-# --- 3. НАСТРОЙКИ ---
+# --- 4. БЛОК НАСТРОЕК ---
 col_in1, col_in2, col_in3 = st.columns(3)
 
 with col_in1:
-    st.subheader("⚙️ Рынок")
-    current_price = st.number_input("BTC Price ($)", value=price_now if price_now > 0 else 73400.0)
-    iv = st.slider("Волатильность (IV %)", 10, 150, 40)
+    st.subheader("⚙️ Рыночные данные")
+    current_price = st.number_input("Текущая цена BTC ($)", value=price_now if price_now > 0 else 73400.0)
+    # Слайдер для волатильности
+    iv = st.slider("Волатильность (IV %)", 10, 150, 40, help="Чем выше IV, тем шире диапазон риска.")
     
     if not df_options.empty:
         expiries = sorted(df_options['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
-        sel_exp = st.selectbox("📅 Дата экспирации Polymarket:", expiries)
+        sel_exp = st.selectbox("📅 Дата экспирации сделки:", expiries)
     else:
         sel_exp = None
+        st.warning("Не удалось загрузить даты из Deribit.")
 
 with col_in2:
-    st.subheader("🎯 Твои Уровни")
-    p_high = st.number_input("Верх (NO)", value=78000)
-    p_low = st.number_input("Низ (YES)", value=70000)
+    st.subheader("🎯 Границы Polymarket")
+    p_high = st.number_input("Верхний барьер (NO)", value=78000)
+    p_low = st.number_input("Нижний барьер (YES)", value=70000)
 
 with col_in3:
-    st.subheader("💰 Сделка")
-    buy_price = st.slider("Цена токена", 0.01, 0.99, 0.85)
-    bet_amount = st.number_input("Ставка ($)", value=100)
+    st.subheader("💰 Деньги")
+    buy_price = st.slider("Цена токена (Polymarket)", 0.05, 0.99, 0.85)
+    bet_amount = st.number_input("Сумма ставки ($)", value=100)
 
-# --- 4. РАСЧЕТ MAX PAIN ---
+# --- 5. ЛОГИКА РАСЧЕТОВ ---
 max_pain = 0
+days_left = 4
+
+# Расчет Max Pain
 if sel_exp and not df_options.empty:
     df_f = df_options[df_options['exp'] == sel_exp]
     strikes = np.sort(df_f['strike'].unique())
     pains = []
+    
+    # Считаем совокупную "боль" для каждого страйка
     for s in strikes:
         c = df_f[df_f['type'] == 'C']
         p = df_f[df_f['type'] == 'P']
         loss = np.sum(np.maximum(0, s - c['strike']) * c['oi']) + np.sum(np.maximum(0, p['strike'] - s) * p['oi'])
         pains.append(loss)
-    max_pain = float(strikes[np.argmin(pains)])
+    
+    if len(pains) > 0:
+        max_pain = float(strikes[np.argmin(pains)])
+    
+    # Считаем дни до экспирации
+    exp_dt = datetime.strptime(sel_exp, "%d%b%y")
+    days_left = max((exp_dt - datetime.utcnow()).days, 1)
 
-# --- 5. МАТЕМАТИКА ВОЛАТИЛЬНОСТИ ---
-from datetime import datetime as dt
-if sel_exp:
-    days_left = (datetime.strptime(sel_exp, "%d%b%y") - datetime.utcnow()).days
-    days_left = max(days_left, 1)
-else:
-    days_left = 4
-
+# Математика волатильности (Expected Move)
 t_years = days_left / 365
 sigma_move = (iv / 100) * math.sqrt(t_years) * current_price
 low_68, high_68 = current_price - sigma_move, current_price + sigma_move
 
-# --- 6. ВЫВОД РЕЗУЛЬТАТОВ ---
+# --- 6. ВИЗУАЛИЗАЦИЯ ---
 st.divider()
 row_res = st.columns(2)
 
 with row_res[0]:
-    st.subheader("📐 Зона Волатильности (68%)")
-    st.write(f"Диапазон: **${low_68:,.0f} — ${high_68:,.0f}**")
+    st.subheader("📐 Риск волатильности (1σ)")
+    st.info(f"Диапазон 68%: **${low_68:,.0f} — ${high_68:,.0f}**")
     
-    if p_high > high_68 and p_low < low_68:
-        st.success("✅ Математика: Уровни БЕЗОПАСНЫ")
-    else:
-        st.error("🚨 Математика: Уровни В ЗОНЕ РИСКА")
+    # Проверка уровней
+    h_safe = p_high > high_68
+    l_safe = p_low < low_68
+    
+    if h_safe: st.success(f"✅ ВЕРХ {p_high} защищен")
+    else: st.error(f"🚨 ВЕРХ {p_high} ПОД УДАРОМ")
+    
+    if l_safe: st.success(f"✅ НИЗ {p_low} защищен")
+    else: st.error(f"🚨 НИЗ {p_low} ПОД УДАРОМ")
 
 with row_res[1]:
-    st.subheader("🧲 Психология (Max Pain)")
+    st.subheader("🧲 Фактор Max Pain")
     if max_pain > 0:
-        st.write(f"Точка Max Pain: **${max_pain:,.0f}**")
-        
-        # Проверка: тянет ли макс пейн цену к нашему барьеру?
+        st.write(f"Точка 'Магнита': **${max_pain:,.0f}**")
+        # Проверка: внутри ли Max Pain нашего диапазона
         if p_low < max_pain < p_high:
-            st.success("✅ Магнит: Внутри коридора (Безопасно)")
-        elif max_pain >= p_high:
-            st.error(f"🚨 Магнит: Выше {p_high}! Рынку выгодно тянуть цену вверх.")
+            st.success("✅ Магнит внутри коридора (Безопасно)")
         else:
-            st.error(f"🚨 Магнит: Ниже {p_low}! Рынку выгодно тянуть цену вниз.")
+            st.warning("⚠️ Магнит ВНЕ коридора. Цену может утянуть.")
+        
+        dist_to_pain = ((max_pain / current_price) - 1) * 100
+        st.write(f"Давление рынка к текущей цене: **{dist_to_pain:+.1f}%**")
     else:
-        st.write("Данные Max Pain недоступны")
+        st.write("Данные Max Pain не определены")
 
-# --- 7. ВЕРДИКТ ---
+# --- 7. ИТОГОВЫЙ ВЕРДИКТ ---
 st.divider()
 profit = (bet_amount / buy_price) - bet_amount
-daily_roi = (profit/bet_amount*100) / days_left
+total_roi = (profit / bet_amount) * 100
+daily_roi = total_roi / days_left
 
-st.subheader("💡 Итоговый анализ")
-if p_high > high_68 and p_low < low_68 and (p_low < max_pain < p_high):
-    st.success(f"🟢 СИЛЬНЫЙ СИГНАЛ: И волатильность, и Max Pain на твоей стороне. Доход: {daily_roi:.2f}% в день.")
-else:
-    st.warning(f"🟡 СМЕШАННЫЙ СИГНАЛ: Есть риск пробития одного из уровней. Проверь дистанцию до Max Pain.")
+st.subheader("💡 Анализ входа")
+col_final1, col_final2 = st.columns([2, 1])
 
-st.metric("Чистая прибыль со ставки", f"${profit:,.2f}")
+with col_final1:
+    if h_safe and l_safe and (p_low < max_pain < p_high):
+        st.success(f"🟢 СТРАТЕГИЯ: ОТЛИЧНО. Ваши границы шире движений рынка, а Max Pain тянет цену в центр.")
+    elif h_safe and l_safe:
+        st.info("🟡 СТРАТЕГИЯ: УДОВЛЕТВОРИТЕЛЬНО. Волатильность не пробивает уровни, но Max Pain тянет цену к одной из границ.")
+    else:
+        st.error("🔴 СТРАТЕГИЯ: ОПАСНО. Математика прогнозирует выход за ваши уровни.")
+
+with col_final2:
+    st.metric("ROI в день", f"{daily_roi:.2f}%")
+    st.metric("Чистая прибыль", f"${profit:,.1f}")
