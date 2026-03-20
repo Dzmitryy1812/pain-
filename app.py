@@ -520,9 +520,9 @@ def get_calendar_path(target_exp: str):
     return "\n".join(days_info)
 
 if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
-    week_low, week_high = get_weekly_extremes()
+    # Теперь мы НЕ запрашиваем экстремумы у Binance, а просим ИИ сделать это
     
-    # Собираем данные по промежуточным дням (до целевой экспирации)
+    # Расчеты для промпта (остаются как были)
     try:
         idx = expiries_list.index(selected_exp)
         start_idx = max(0, idx - 3)
@@ -534,62 +534,46 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
     for e in target_exps:
         df_e = df_options[df_options['exp'] == e].copy()
         if df_e.empty: continue
-        
         _, _, mp = calc_max_pain(df_e)
         T_e = max((parse_expiry(e) - datetime.now(timezone.utc)).total_seconds(), 300) / (365 * 24 * 3600)
         df_e["g"] = df_e.apply(lambda rr: calc_gamma(spot_price, rr["strike"], iv_used, T_e, r=r), axis=1)
         df_e["gx"] = df_e.apply(lambda rr: rr["oi"] * rr["g"] * spot_price**2 * 0.01 * (1 if rr["type"] == "C" else -1), axis=1)
         total_gx = df_e["gx"].sum()
-        
         gex_type = "Положительный (держит флэт)" if total_gx > 0 else "Отрицательный (риск пробоя)"
         multi_day_text += f"- {e}: Max Pain ${mp:,.0f}, GEX: {gex_type} ({total_gx:,.0f})\n"
 
-    # Календарь дней до экспирации
     calendar_path = get_calendar_path(selected_exp)
 
-    # Формируем текст промпта
+    # ОБНОВЛЕННЫЙ ТЕКСТ ПРОМПТА (инструкция для ИИ внутри)
     prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
-Моя стратегия: Синтетический короткий стрэнгл на Polymarket. Ставка на удержание цены в диапазоне до экспирации для заработка на тета-распаде.
-Я покупаю "YES" на нижний барьер (цена не упадет ниже) и "NO" на верхний (цена не вырастет выше). Важно оценить защиту диапазонов.
+Моя стратегия: Синтетический короткий стрэнгл на Polymarket. Ставка на удержание цены в диапазоне.
 
-[ДАННЫЕ РЫНКА]
-1. Базовые метрики:
-- Текущий Spot BTC: ${spot_price:,.0f}
-- Текущий DVOL (Ожидаемая волатильность): {current_dvol:.1f}%
-- 7 дней экстремумы: Низ ${week_low:,.0f}, Верх ${week_high:,.0f}
+[ИНСТРУКЦИЯ ПО РЫНКУ]
+1. Текущий Spot BTC: ${spot_price:,.0f}
+2. Текущий DVOL (Ожидаемая волатильность): {current_dvol:.1f}%
 
-2. Моя сделка на Polymarket (Дата: {selected_exp}):
-- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Цена YES: ${p_low_price:.2f}. BSM (P > low): {prob_above_low*100:.1f}%
-- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Цена NO: ${p_high_price:.2f}. BSM (P < high): {prob_below_high*100:.1f}%
-- BSM вероятность удержания ВНУТРИ: {prob_inside*100:.1f}%
+ТЕБЕ ЗАДАЧА №0: Самостоятельно проверь/используй данные о цене BTC за последние 7 дней. Найди экстремумы (High/Low) этой недели, чтобы оценить вероятность пробоя моих барьеров.
 
-3. Динамика опционов (путь до экспирации):
+[МОЯ СДЕЛКА НА POLYMARKET] (Дата экспирации: {selected_exp})
+- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Моя цена захода (YES): ${p_low_price:.2f}. BSM вероятность: {prob_above_low*100:.1f}%
+- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Моя цена захода (NO): ${p_high_price:.2f}. BSM вероятность: {prob_below_high*100:.1f}%
+- BSM вероятность удержания ВНУТРИ коридора: {prob_inside*100:.1f}%
+
+[ДАННЫЕ ПО ОПЦИОНАМ DERIBIT]
 {multi_day_text}
 
-4. Календарь до экспирации:
+[КАЛЕНДАРНЫЙ КОНТЕКСТ]
 {calendar_path}
-
-5. Макро-события (ПРОВЕРЬ САМ):
-Проверь экономический календарь (https://www.forexfactory.com/calendar или https://www.investing.com/economic-calendar/) 
-на период с сегодня до {selected_exp} на наличие:
-- FOMC заседания / выступления Пауэлла
-- CPI / PPI (инфляция США)
-- NFP (Non-Farm Payrolls)
-- GDP / Retail Sales
-- Крипто-специфичные события (решения SEC, листинги ETF, хардфорки)
 
 [ТВОЯ ЗАДАЧА]
 Выдай ответ строго в Markdown:
 1. 🎯 Вердикт ИИ: ОДОБРЕНО / ПРОПУСК / ОПАСНО (и оценка 1-10). Кратко логику.
-2. 🛡️ Защита диапазона: Сравни барьеры с экстремумами 7 дней. Помогает ли текущий GEX маркетмейкеров гасить волатильность внутри моего коридора?
+2. 🛡️ Анализ экстремумов: Исходя из цен BTC за последние 7 дней (которые ты нашел), находятся ли мои барьеры ${p_low_strike:,.0f} и ${p_high_strike:,.0f} ПРЕДЕЛАМИ или ВНУТРИ недавнего торгового диапазона?
 3. 🧲 Цели (Max Pain): Как движется Max Pain к {selected_exp}? Вытянет ли он цену за мой барьер?
-4. 📅 Календарный риск: Есть ли на пути выходные (низкая ликвидность)? Попадают ли на эти дни сильные макро-события?
+4. 📅 Макро-риск: Проверь экономический календарь на период до {selected_exp}. Есть ли риск сильной волатильности (CPI, FOMC, NFP)?
 5. ⚖️ Финансовый Edge: Оправдывает ли стоимость входа (Polymarket) риски (BSM)?
-6. ⚠️ Угроза: Где наибольший риск гамма-сквиза в этих данных?
+6. ⚠️ Угроза: Где наибольший риск провала сделки?
 """
 
-    st.success("✅ Промпт сгенерирован! Нажми на иконку копирования в правом верхнем углу блока ниже:")
+    st.success("✅ Промпт готов! Теперь ИИ сам найдет волатильность за неделю.")
     st.code(prompt_text, language="markdown")
-
-
-
