@@ -241,9 +241,16 @@ T_years = max(
 ) / (365 * 24 * 3600)
 
 # Вероятности (BSM risk-neutral)
-prob_above_low = lognormal_prob_above(spot_price, p_low_strike, iv_used, T_years, r=r)
-prob_below_high = lognormal_prob_below(spot_price, p_high_strike, iv_used, T_years, r=r)
+prob_above_low  = lognormal_prob_above(spot_price, p_low_strike,  iv_used, T_years, r=r)
+prob_above_high = lognormal_prob_above(spot_price, p_high_strike, iv_used, T_years, r=r)
+prob_below_high = 1.0 - prob_above_high  # или lognormal_prob_below(...)
 
+prob_inside = max(0.0, min(1.0, prob_above_low - prob_above_high))
+
+c1, c2, c3 = st.columns(3)
+c1.metric("P(выше low)",  f"{prob_above_low*100:.1f}%")
+c2.metric("P(ниже high)", f"{prob_below_high*100:.1f}%")
+c3.metric("P(в диапазоне)", f"{prob_inside*100:.1f}%")
 # Расчёты
 st_pain, val_pain, max_pain = calc_max_pain(df)
 
