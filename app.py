@@ -518,25 +518,77 @@ poly_url = st.text_input("Вставь ссылку", value="https://polymarket.
 
 if st.button("🚀 Найти страйки в событии", type="primary", use_container_width=True):
     try:
-        slug = poly_url.rstrip('/').split('/')[-1]
+        slug = poly_url.rstrip("/").split("/")[-1]
         api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
-        
+
         with st.spinner("Загрузка данных из API..."):
-            res = requests.get(api_url, timeout=10).json()
-        
-        if res and isinstance(res, list):
-            markets = res[0].get("markets", [])
-            st.write(f"✅ Успешно! Найдено инструментов в ссылке: {len(markets)}")
-            
-            # Собираем данные
-            found_data = []
-            for m in markets:
-                q = m.get("question", "")
-                prices = m.get("outcomePrices", ["0", "0"])
-                
-                # Обработка цен (строка -> список -> float)
-                if isinstance(prices, str):
-                    import json
+            res = requests.get(api_url, timeout=10)
+            res.raise_for_status()
+            data = res.json()
+
+        if not data or not isinstance(data, list):
+            st.error("❌ API вернул неожиданный формат данных.")
+            st.stop()
+
+        event = data[0]
+        markets = event.get("markets", []) or []
+        st.write(f"✅ Успешно! Найдено инструментов в ссылке: {len(markets)}")
+
+        found_data = []
+        for m in markets:
+            q = (m.get("question") or "").strip()
+            prices = m.get("outcomePrices", ["0", "0"])
+
+            # outcomePrices иногда приходит как строка JSON
+            if isinstance(prices, str):
+                import json
+                try:
                     prices = json.loads(prices)
-                
-                y = float(prices[0]) if
+                except Exception:
+                    prices = ["0", "0"]
+
+            # Нормализация и защита от кривых данных
+            if not isinstance(prices, (list, tuple)) or len(prices) < 2:
+                prices = ["0", "0"]
+
+            try:
+                y = float(prices[0])  # YES
+            except Exception:
+                y = 0.0
+            try:
+                n = float(prices[1])  # NO
+            except Exception:
+                n = 0.0
+
+            # Достаём "страйк" из вопроса: "... above $70,000 on March 24?"
+            import re
+            m_strike = re.search(r"\$?\s*([\d{1,3}(?:[,\s]\d{3})*]+)", q)
+            strike = None
+            if m_strike:
+                raw = m_strike.group(1)
+                strike = float(raw.replace(",", "").replace(" ", "")) if raw else None
+
+            found_data.append(
+                {
+                    "question": q,
+                    "strike": strike,
+                    "yes": y,
+                    "no": n,
+                    "market_id": m.get("id"),
+                    "condition_id": m.get("conditionId"),
+                }
+            )
+
+        import pandas as pd
+
+        df = pd.DataFrame(found_data)
+        # сортируем по страйку, если он есть
+        if "strike" in df.columns:
+            df = df.sort_values(by="strike", na_position="last")
+
+        st.dataframe(df, use_container_width=True)
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Ошибка сети/API: {e}")
+    except Exception as e:
+        st.error(f"❌ Непредвиденная ошибка: {e}")
