@@ -397,3 +397,77 @@ with col2:
         st.success(f"✅ Выгодно покупать NO (edge {edge_h*100:.1f}%)")
     else:
         st.error(f"❌ Дорого — нет преимущества (edge {edge_h*100:.1f}%)")
+
+
+# --- 7. ГЕНЕРАТОР ПРОМПТА ДЛЯ ИИ ---
+st.divider()
+st.markdown("### 🤖 Генератор AI-Промпта")
+st.write("Сгенерировать готовый промпт с текущими переменными для ChatGPT или Claude.")
+
+# Функция получения экстремумов за 7 дней
+@st.cache_data(ttl=3600)
+def get_weekly_extremes():
+    try:
+        r = requests.get("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=7", timeout=3).json()
+        lows = [float(candle[3]) for candle in r]
+        highs = [float(candle[2]) for candle in r]
+        return min(lows), max(highs)
+    except Exception:
+        return spot_price * 0.9, spot_price * 1.1 # Fallback
+
+if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
+    week_low, week_high = get_weekly_extremes()
+    
+    # Собираем данные по промежуточным дням (до целевой экспирации)
+    try:
+        idx = expiries_list.index(selected_exp)
+        # Берем саму экспирацию и до 3 предыдущих
+        start_idx = max(0, idx - 3)
+        target_exps = expiries_list[start_idx:idx+1]
+    except ValueError:
+        target_exps = [selected_exp]
+
+    multi_day_text = ""
+    for e in target_exps:
+        df_e = df_options[df_options['exp'] == e].copy()
+        if df_e.empty: continue
+        
+        _, _, mp = calc_max_pain(df_e)
+        T_e = max((parse_expiry(e) - datetime.now(timezone.utc)).total_seconds(), 300) / (365 * 24 * 3600)
+        df_e["g"] = df_e.apply(lambda rr: calc_gamma(spot_price, rr["strike"], iv_used, T_e, r=r), axis=1)
+        df_e["gx"] = df_e.apply(lambda rr: rr["oi"] * rr["g"] * spot_price**2 * 0.01 * (1 if rr["type"] == "C" else -1), axis=1)
+        total_gx = df_e["gx"].sum()
+        
+        # Определяем знак GEX
+        gex_type = "Положительный (держит флэт)" if total_gx > 0 else "Отрицательный (риск пробоя)"
+        multi_day_text += f"- {e}: Max Pain ${mp:,.0f}, GEX: {gex_type} ({total_gx:,.0f})\n"
+
+    # Формируем текст промпта
+    prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
+Моя стратегия: Синтетический короткий стрэнгл на Polymarket. Ставка на удержание цены в диапазоне до экспирации для заработка на тета-распаде.
+Я покупаю "YES" на нижний барьер (цена не упадет ниже) и "NO" на верхний (цена не вырастет выше). Важно оценить защиту диапазонов.
+
+[ДАННЫЕ РЫНКА]
+1. Базовые метрики:
+- Текущий Spot BTC: ${spot_price:,.0f}
+- Текущий DVOL (Ожидаемая волатильность): {current_dvol:.1f}%
+- 7 дней экстремумы: Низ ${week_low:,.0f}, Верх ${week_high:,.0f}
+
+2. Моя сделка на Polymarket (Дата: {selected_exp}):
+- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Цена YES: ${p_low_price:.2f}. BSM (P > low): {prob_above_low*100:.1f}%
+- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Цена NO: ${p_high_price:.2f}. BSM (P < high): {prob_below_high*100:.1f}%
+- BSM вероятность удержания ВНУТРИ: {prob_inside*100:.1f}%
+
+3. Динамика опционов (путь до экспирации):
+{multi_day_text}
+[ТВОЯ ЗАДАЧА]
+Выдай ответ строго в Markdown:
+1. 🎯 Вердикт ИИ: ОДОБРЕНО / ПРОПУСК / ОПАСНО (и оценка 1-10). Кратко логику.
+2. 🛡️ Защита диапазона: Сравни барьеры с экстремумами 7 дней. Помогает ли текущий GEX маркетмейкеров гасить волатильность внутри моего коридора?
+3. 🧲 Цели (Max Pain): Как движется Max Pain к {selected_exp}? Вытянет ли он цену за мой барьер?
+4. ⚖️ Финансовый Edge: Оправдывает ли стоимость входа (Polymarket) риски (BSM)?
+5. ⚠️ Угроза: Где наибольший риск гамма-сквиза в этих данных?
+"""
+
+    st.success("✅ Промпт сгенерирован! Нажми на иконку копирования в правом верхнем углу блока ниже:")
+    st.code(prompt_text, language="markdown")
