@@ -487,12 +487,21 @@ st.write("Сгенерировать готовый промпт с текущи
 @st.cache_data(ttl=3600)
 def get_weekly_extremes():
     try:
-        r = requests.get("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=7", timeout=3).json()
+        # Увеличиваем таймаут и проверяем статус ответа
+        response = requests.get(
+            "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=7", 
+            timeout=5
+        )
+        if response.status_code != 200:
+            return None, None
+        
+        r = response.json()
         lows = [float(candle[3]) for candle in r]
         highs = [float(candle[2]) for candle in r]
         return min(lows), max(highs)
-    except Exception:
-        return spot_price * 0.9, spot_price * 1.1
+    except Exception as e:
+        print(f"Ошибка запроса к Binance: {e}")
+        return None, None
 
 # Функция для определения дней недели на пути к экспирации
 def get_calendar_path(target_exp: str):
