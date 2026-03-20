@@ -510,101 +510,33 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
 
 
-# --- 8. POLYMARKET AUTO-CHECKER (ULTRA-ROBUST) ---
+# --- 8. POLYMARKET SCANNER (FINAL) ---
 st.divider()
-st.markdown("### 🔗 Блок 8: Синхронизация с Polymarket")
+st.header("🔗 Блок 8: Сканер Polymarket")
 
-import json  # Добавляем для парсинга странных строк из API
+poly_url = st.text_input("Вставь ссылку", value="https://polymarket.com/event/bitcoin-above-on-march-24")
 
-poly_url = st.text_input(
-    "Вставь ссылку на событие", 
-    value="https://polymarket.com/event/bitcoin-above-on-march-24",
-    key="poly_url_final"
-)
-
-if st.button("🚀 Синхронизировать цены", use_container_width=True, type="primary"):
-    if not poly_url or "polymarket.com/event/" not in poly_url:
-        st.error("Вставь корректную ссылку на /event/...")
-    else:
-        try:
-            slug = poly_url.rstrip('/').split('/')[-1]
-            api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+if st.button("🚀 Найти страйки в событии", type="primary", use_container_width=True):
+    try:
+        slug = poly_url.rstrip('/').split('/')[-1]
+        api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+        
+        with st.spinner("Загрузка данных из API..."):
+            res = requests.get(api_url, timeout=10).json()
+        
+        if res and isinstance(res, list):
+            markets = res[0].get("markets", [])
+            st.write(f"✅ Успешно! Найдено инструментов в ссылке: {len(markets)}")
             
-            with st.spinner("Связь с Polymarket..."):
-                res = requests.get(api_url, timeout=10).json()
-
-            if not res or not isinstance(res, list):
-                st.error("Данные не найдены. Проверь ссылку.")
-            else:
-                event_data = res[0]
-                markets = event_data.get("markets", [])
+            # Собираем данные
+            found_data = []
+            for m in markets:
+                q = m.get("question", "")
+                prices = m.get("outcomePrices", ["0", "0"])
                 
-                low_found = False
-                high_found = False
-                available_info = []
-
-                # Берем страйки из системы
-                target_low = st.session_state.p_low_strike
-                target_high = st.session_state.p_high_strike
-
-                for m in markets:
-                    question = m.get("question", "").lower()
-                    
-                    # --- БЕЗОПАСНЫЙ ПАРСИНГ ЦЕНЫ ---
-                    y_price, n_price = None, None
-                    prices_raw = m.get("outcomePrices")
-
-                    # Если API вернуло строку типа '["0.80", "0.20"]', превращаем её в список
-                    if isinstance(prices_raw, str):
-                        try:
-                            prices_raw = json.loads(prices_raw)
-                        except:
-                            pass
-                    
-                    # Если теперь у нас список, берем данные
-                    if isinstance(prices_raw, list) and len(prices_raw) >= 2:
-                        y_price = float(prices_raw[0])
-                        n_price = float(prices_raw[1])
-                    else:
-                        # Запасной вариант через токены
-                        tokens = m.get("tokens", [])
-                        if len(tokens) >= 2:
-                            y_price = float(tokens[0].get("price", 0.5))
-                            n_price = float(tokens[1].get("price", 0.5))
-                    
-                    if y_price is None: continue # Пропускаем маркет без цен
-
-                    # --- ПАРСИНГ СТРАЙКА ---
-                    import re
-                    match = re.search(r'([\d,.]+)\s*k?', question)
-                    if match:
-                        num_str = match.group(1).replace(',', '')
-                        curr_m_strike = int(float(num_str) * 1000) if 'k' in question else int(float(num_str))
-                        
-                        available_info.append(f"{curr_m_strike} ({'above' if 'above' in question else 'below'})")
-
-                        # Проверяем нижний страйк
-                        if curr_m_strike == target_low and "above" in question:
-                            st.session_state.p_low_price = y_price
-                            low_found = True
-                        
-                        # Проверяем верхний страйк
-                        if curr_m_strike == target_high:
-                            if "above" in question:
-                                st.session_state.p_high_price = n_price
-                                high_found = True
-                            elif "below" in question:
-                                st.session_state.p_high_price = y_price
-                                high_found = True
-
-                # Итоги
-                if low_found and high_found:
-                    st.success(f"✅ Готово! Сверху: ${st.session_state.p_high_price:.2f}, Снизу: ${st.session_state.p_low_price:.2f}")
-                    st.rerun()
-                else:
-                    if not low_found: st.warning(f"Низ {target_low} 'Above' не найден.")
-                    if not high_found: st.warning(f"Верх {target_high} 'Above/Below' не найден.")
-                    st.info(f"Доступные цены в этой ссылке: {', '.join(set(available_info))}")
-
-        except Exception as e:
-            st.error(f"Ошибка: {str(e)}")
+                # Обработка цен (строка -> список -> float)
+                if isinstance(prices, str):
+                    import json
+                    prices = json.loads(prices)
+                
+                y = float(prices[0]) if
