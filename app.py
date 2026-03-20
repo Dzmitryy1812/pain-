@@ -413,7 +413,23 @@ def get_weekly_extremes():
         highs = [float(candle[2]) for candle in r]
         return min(lows), max(highs)
     except Exception:
-        return spot_price * 0.9, spot_price * 1.1 # Fallback
+        return spot_price * 0.9, spot_price * 1.1
+
+# Функция для определения дней недели на пути к экспирации
+def get_calendar_path(target_exp: str):
+    now = datetime.now(timezone.utc)
+    exp_dt = parse_expiry(target_exp)
+    days_info = []
+    
+    current = now
+    while current.date() <= exp_dt.date():
+        day_name = current.strftime("%A")  # Monday, Tuesday, etc.
+        is_weekend = day_name in ["Saturday", "Sunday"]
+        emoji = "🏖️" if is_weekend else "📊"
+        days_info.append(f"{emoji} {current.strftime('%d %b')} ({day_name})")
+        current += timedelta(days=1)
+    
+    return "\n".join(days_info)
 
 if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
     week_low, week_high = get_weekly_extremes()
@@ -421,7 +437,6 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
     # Собираем данные по промежуточным дням (до целевой экспирации)
     try:
         idx = expiries_list.index(selected_exp)
-        # Берем саму экспирацию и до 3 предыдущих
         start_idx = max(0, idx - 3)
         target_exps = expiries_list[start_idx:idx+1]
     except ValueError:
@@ -438,9 +453,11 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
         df_e["gx"] = df_e.apply(lambda rr: rr["oi"] * rr["g"] * spot_price**2 * 0.01 * (1 if rr["type"] == "C" else -1), axis=1)
         total_gx = df_e["gx"].sum()
         
-        # Определяем знак GEX
         gex_type = "Положительный (держит флэт)" if total_gx > 0 else "Отрицательный (риск пробоя)"
         multi_day_text += f"- {e}: Max Pain ${mp:,.0f}, GEX: {gex_type} ({total_gx:,.0f})\n"
+
+    # Календарь дней до экспирации
+    calendar_path = get_calendar_path(selected_exp)
 
     # Формируем текст промпта
     prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
@@ -460,13 +477,27 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
 3. Динамика опционов (путь до экспирации):
 {multi_day_text}
+
+4. Календарь до экспирации:
+{calendar_path}
+
+5. Макро-события (ПРОВЕРЬ САМ):
+Проверь экономический календарь (https://www.forexfactory.com/calendar или https://www.investing.com/economic-calendar/) 
+на период с сегодня до {selected_exp} на наличие:
+- FOMC заседания / выступления Пауэлла
+- CPI / PPI (инфляция США)
+- NFP (Non-Farm Payrolls)
+- GDP / Retail Sales
+- Крипто-специфичные события (решения SEC, листинги ETF, хардфорки)
+
 [ТВОЯ ЗАДАЧА]
 Выдай ответ строго в Markdown:
 1. 🎯 Вердикт ИИ: ОДОБРЕНО / ПРОПУСК / ОПАСНО (и оценка 1-10). Кратко логику.
 2. 🛡️ Защита диапазона: Сравни барьеры с экстремумами 7 дней. Помогает ли текущий GEX маркетмейкеров гасить волатильность внутри моего коридора?
 3. 🧲 Цели (Max Pain): Как движется Max Pain к {selected_exp}? Вытянет ли он цену за мой барьер?
-4. ⚖️ Финансовый Edge: Оправдывает ли стоимость входа (Polymarket) риски (BSM)?
-5. ⚠️ Угроза: Где наибольший риск гамма-сквиза в этих данных?
+4. 📅 Календарный риск: Есть ли на пути выходные (низкая ликвидность)? Попадают ли на эти дни сильные макро-события?
+5. ⚖️ Финансовый Edge: Оправдывает ли стоимость входа (Polymarket) риски (BSM)?
+6. ⚠️ Угроза: Где наибольший риск гамма-сквиза в этих данных?
 """
 
     st.success("✅ Промпт сгенерирован! Нажми на иконку копирования в правом верхнем углу блока ниже:")
