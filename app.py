@@ -200,4 +200,11 @@ else:
         if edge_low > 0.03: st.success(f"✅ ВЫГОДНО! Edge: **+{edge_low*100:.1f}%**")
         else: st.error(f"❌ ПЕРЕПЛАТА. Edge: **{edge_low*100:.1f}%**")
             
-    with res_
+    with res_col2:
+        st.info(f"**Анализ Верхнего Барьера (${p_high_strike:,.0f}):**")
+        if edge_high > 0.03: st.success(f"✅ ВЫГОДНО! Edge: **+{edge_high*100:.1f}%**")
+        else: st.error(f"❌ ПЕРЕПЛАТА. Edge: **{edge_high*100:.1f}%**")
+
+    if df_agg['volume'].sum() > 0:
+        top_strike = df_agg.loc[df_agg['volume'].idxmax(), 'strike']
+        st.write(f"🔥 **Smart Money:** Максимальный проторгованный объем сегодня на страйке **${top_strike:,.0f}**.")
