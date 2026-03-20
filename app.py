@@ -4,32 +4,48 @@ import numpy as np
 import requests
 import math
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import datetime, timezone, timedelta
 from scipy.stats import norm
 
-# --- 1. КОНФИГУРАЦИЯ ---
+# --- 1. КОНФИГУРАЦИЯ СТРАНИЦЫ ---
 st.set_page_config(page_title="BTC Alpha Terminal v4.8", layout="wide")
 
-# --- 2. ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ ---
-@st.cache_data(ttl=60)
-def get_btc_data():
-    """Получение цены и волатильности (DVOL)"""
+# --- 2. ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ (КАСКАД API) ---
+@st.cache_data(ttl=30)
+def get_market_data():
+    """Получение цены BTC из 4 источников + волатильность DVOL"""
+    price = 70000.0
+    source = "Fallback"
+    
+    # Список API для цены
+    endpoints = [
+        ("Binance", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", lambda r: float(r['price'])),
+        ("Bybit", "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT", lambda r: float(r['result']['list'][0]['lastPrice'])),
+        ("Coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot", lambda r: float(r['data']['amount'])),
+        ("Deribit", "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", lambda r: float(r['result']['index_price']))
+    ]
+    
+    for name, url, parser in endpoints:
+        try:
+            res = requests.get(url, timeout=3).json()
+            price = parser(res)
+            source = name
+            break 
+        except:
+            continue
+
+    # Волатильность DVOL (только Deribit)
     try:
-        # Индексная цена Deribit
-        p_res = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", timeout=5).json()
-        price = float(p_res['result']['index_price'])
-        
-        # Индекс волатильности DVOL
         v_res = requests.get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1", timeout=5).json()
         dvol = float(v_res['result']['data'][-1][3])
     except:
-        price, dvol = 70000.0, 55.0
-    return price, dvol
+        dvol = 55.0
+
+    return price, dvol, source
 
 @st.cache_data(ttl=300)
-def get_deribit_options():
-    """Получение всей книги опционов"""
+def get_options_data():
+    """Получение данных опционов с Deribit (OI, Volume, IV)"""
     try:
         url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
         res = requests.get(url, timeout=15).json()
@@ -42,13 +58,14 @@ def get_deribit_options():
                     'strike': float(parts[2]), 
                     'type': parts[3], 
                     'oi': float(x.get('open_interest', 0)),
+                    'volume': float(x.get('volume', 0)),
                     'iv': float(x.get('mark_iv', 0)) / 100 if x.get('mark_iv') else 0.5
                 })
         return pd.DataFrame(rows)
     except:
         return pd.DataFrame()
 
-# --- 3. МАТЕМАТИЧЕСКИЕ ФУНКЦИИ ---
+# --- 3. МАТЕМАТИЧЕСКИЕ РАСЧЕТЫ ---
 def calc_gamma(S, K, iv, T):
     if S <= 0 or K <= 0 or iv <= 0 or T <= 0: return 0.0
     d1 = (np.log(S/K) + (0.5 * iv**2) * T) / (iv * np.sqrt(T))
@@ -65,115 +82,73 @@ def calculate_max_pain(df_exp):
         pains.append(loss)
     return strikes, pains, float(strikes[np.argmin(pains)])
 
-# --- 4. БОКОВАЯ ПАНЕЛЬ (НАСТРОЙКИ) ---
-price_now, dvol_now = get_btc_data()
-df_all = get_options_book = get_deribit_options()
+# --- 4. БОКОВАЯ ПАНЕЛЬ ---
+price_now, dvol_now, active_src = get_market_data()
+df_raw = get_options_data()
 
 with st.sidebar:
-    st.header(f"💰 BTC: ${price_now:,.0f}")
-    st.caption(f"DVOL: {dvol_now:.1f}%")
+    st.header(f"💰 BTC: ${price_now:,.1f}")
+    st.caption(f"Источник: {active_src} | DVOL: {dvol_now:.1f}%")
     
-    if st.button("🔄 Обновить данные"):
+    if st.button("🔄 Обновить данные", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-
-    st.divider()
-    st.subheader("🎯 Барьеры Polymarket")
-    p_low = st.number_input("Нижний барьер (Stay Above)", value=int(price_now - 5000), step=500)
-    p_low_price = st.slider("Цена YES на Poly (0.xx)", 0.05, 0.95, 0.80)
     
-    p_high = st.number_input("Верхний барьер (Stay Below)", value=int(price_now + 5000), step=500)
-    p_high_price = st.slider("Цена NO на Poly (0.xx)", 0.05, 0.95, 0.80)
+    st.divider()
+    st.subheader("🎯 Polymarket Контроль")
+    p_low = st.number_input("НИЗ (Long Above)", value=int(price_now - 4000), step=500)
+    p_low_yes = st.slider("Цена YES на Poly", 0.01, 0.99, 0.85)
+    
+    p_high = st.number_input("ВЕРХ (Stay Below)", value=int(price_now + 4000), step=500)
+    p_high_no = st.slider("Цена NO на Poly", 0.01, 0.99, 0.85)
 
     st.divider()
-    iv_adj = st.slider("Корректировка IV %", 10, 150, int(dvol_now)) / 100
-    range_pct = st.sidebar.slider("Масштаб графика %", 5, 40, 15)
+    iv_work = st.slider("Рабочая IV %", 10, 150, int(dvol_now)) / 100
+    zoom = st.slider("Масштаб графика %", 5, 40, 15)
 
 # --- 5. ОСНОВНОЙ ЭКРАН ---
-st.title("🛡️ BTC Alpha Terminal v4.8")
+st.title("🛡️ BTC Alpha Terminal v4.8 (Pro)")
 
-if not df_all.empty:
+if not df_raw.empty:
     # Выбор даты
-    expiries = sorted(df_all['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
-    sel_exp = st.selectbox("📅 Выберите экспирацию для анализа:", expiries)
+    expiries = sorted(df_raw['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
+    sel_exp = st.selectbox("📅 Дата экспирации:", expiries)
     
-    # Расчет времени
+    # Фильтрация и расчеты
+    df_f = df_raw[df_raw['exp'] == sel_exp].copy()
     exp_dt = datetime.strptime(sel_exp, "%d%b%y").replace(tzinfo=timezone.utc) + timedelta(hours=8)
-    time_to_exp = (exp_dt - datetime.now(timezone.utc)).total_seconds() / (365 * 24 * 3600)
     hours_left = (exp_dt - datetime.now(timezone.utc)).total_seconds() / 3600
+    T = max(hours_left / (24 * 365), 0.0001)
 
-    # Фильтрация данных
-    df_f = df_all[df_all['exp'] == sel_exp].copy()
-    strikes_pain, pains_vals, max_pain = calculate_max_pain(df_f)
+    # Вероятности
+    std = iv_work * math.sqrt(T)
+    prob_above = 1 - norm.cdf((math.log(p_low/price_now) + 0.5*std**2)/std)
+    prob_below = norm.cdf((math.log(p_high/price_now) + 0.5*std**2)/std)
+
+    # Max Pain и ГEX
+    strikes_p, pains_v, max_pain = calculate_max_pain(df_f)
+    df_f['gamma'] = df_f.apply(lambda x: calc_gamma(price_now, x['strike'], iv_work, T), axis=1)
+    df_f['gex'] = df_f.apply(lambda x: x['oi'] * x['gamma'] * (price_now**2) * 0.01 * (1 if x['type']=='C' else -1), axis=1)
     
-    # Расчет ГEX
-    df_f['gamma'] = df_f.apply(lambda x: calc_gamma(price_now, x['strike'], iv_adj, max(time_to_exp, 0.0001)), axis=1)
-    df_f['gex'] = df_f.apply(lambda x: x['oi'] * x['gamma'] * (price_now**2) * 0.01 * (1 if x['type'] == 'C' else -1), axis=1)
-    
-    gex_sum = df_f.groupby('strike')['gex'].sum()
-    strikes_gex = gex_sum.index.values
-    gex_vals = gex_sum.values
+    agg = df_f.groupby('strike').agg({'oi': 'sum', 'volume': 'sum', 'gex': 'sum'}).reset_index()
 
-    # Вероятности (Normal Dist)
-    std_dev = iv_adj * math.sqrt(max(time_to_exp, 0.0001))
-    prob_above_low = 1 - norm.cdf((math.log(p_low/price_now) + 0.5 * std_dev**2) / std_dev)
-    prob_below_high = norm.cdf((math.log(p_high/price_now) + 0.5 * std_dev**2) / std_dev)
-    
-    edge_low = prob_above_low - p_low_price
-    edge_high = prob_below_high - p_high_price
+    # --- ВИЗУАЛИЗАЦИЯ (МЕТРИКИ) ---
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("MAX PAIN", f"${max_pain:,.0f}", f"{((max_pain/price_now-1)*100):.1f}%")
+    m2.metric(f"P > {p_low}", f"{prob_above*100:.1f}%")
+    m3.metric(f"P < {p_high}", f"{prob_below*100:.1f}%")
+    m4.metric("ДО ЗАКРЫТИЯ", f"{hours_left/24:.1f} дн")
+    m5.metric("VOLUME (BTC)", f"{df_f['volume'].sum():,.0f}")
 
-    # --- Метрики ---
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("ТЕКУЩАЯ ЦЕНА", f"${price_now:,.0f}")
-    m2.metric("MAX PAIN", f"${max_pain:,.0f}", f"{((max_pain/price_now-1)*100):.1f}%")
-    m3.metric("ВЕРОЯТНОСТЬ LOW", f"{prob_above_low*100:.1f}%")
-    m4.metric("ВЕРОЯТНОСТЬ HIGH", f"{prob_below_high*100:.1f}%")
+    # --- ГРАФИК 1: ОБЪЕМ VS OI ---
+    st.subheader("📊 Активность: Открытый интерес и Объемы 24ч")
+    fig_vol = go.Figure()
+    fig_vol.add_trace(go.Bar(x=agg['strike'], y=agg['oi'], name="Open Interest", marker_color='rgba(100, 149, 237, 0.5)'))
+    fig_vol.add_trace(go.Bar(x=agg['strike'], y=agg['volume'], name="Volume 24h", marker_color='orange'))
+    fig_vol.add_vline(x=price_now, line_dash="dash", line_color="white", annotation_text="SPOT")
+    fig_vol.update_layout(template="plotly_dark", height=400, barmode='group',
+                         xaxis_range=[price_now*(1-zoom/100), price_now*(1+zoom/100)])
+    st.plotly_chart(fig_vol, use_container_width=True)
 
-    # --- Графики ---
-    col_chart1, col_chart2 = st.columns(2)
-    
-    with col_chart1:
-        fig_gex = go.Figure()
-        colors = ['#00FF00' if x > 0 else '#FF0000' for x in gex_vals]
-        fig_gex.add_trace(go.Bar(x=strikes_gex, y=gex_vals, marker_color=colors, name="Gamma Exposure"))
-        fig_gex.add_vline(x=price_now, line_color="white", line_dash="dash", annotation_text="SPOT")
-        fig_gex.update_layout(title="Гамма Профиль (GEX)", template="plotly_dark", 
-                             xaxis_range=[price_now*(1-range_pct/100), price_now*(1+range_pct/100)])
-        st.plotly_chart(fig_gex, use_container_width=True)
-
-    with col_chart2:
-        fig_pain = go.Figure()
-        fig_pain.add_trace(go.Scatter(x=strikes_pain, y=pains_vals, fill='tozeroy', line_color='#E066FF', name="Loss Function"))
-        fig_pain.add_vline(x=max_pain, line_color="yellow", line_dash="dot", annotation_text="MAX PAIN")
-        fig_pain.update_layout(title="Max Pain Heatmap", template="plotly_dark",
-                              xaxis_range=[price_now*(1-range_pct/100), price_now*(1+range_pct/100)])
-        st.plotly_chart(fig_pain, use_container_width=True)
-
-    # --- Блок вердикта ---
-    st.divider()
-    st.subheader("🧬 Вердикт и Сигналы")
-    
-    c1, c2, c3 = st.columns(3)
-    
-    with c1:
-        st.info("**Анализ Нижнего Барьера:**")
-        if edge_low > 0.05: st.success(f"✅ ВЫГОДНО: Edge {edge_low*100:.1f}%")
-        elif edge_low > 0: st.warning(f"⚖️ НЕЙТРАЛЬНО: Edge {edge_low*100:.1f}%")
-        else: st.error(f"❌ ПЕРЕПЛАТА: {abs(edge_low)*100:.1f}%")
-        
-    with c2:
-        st.info("**Анализ Верхнего Барьера:**")
-        if edge_high > 0.05: st.success(f"✅ ВЫГОДНО: Edge {edge_high*100:.1f}%")
-        elif edge_high > 0: st.warning(f"⚖️ НЕЙТРАЛЬНО: Edge {edge_high*100:.1f}%")
-        else: st.error(f"❌ ПЕРЕПЛАТА: {abs(edge_high)*100:.1f}%")
-
-    with c3:
-        st.info("**Магнит и Время:**")
-        st.write(f"До экспирации: **{hours_left/24:.1f} дней**")
-        dist = (max_pain - price_now)
-        if abs(dist) < 500: st.write("🎯 Цена в зоне комфорта маркетмейкера.")
-        elif dist > 0: st.write(f"🐂 Ожидается подтяжка вверх к ${max_pain:,.0f}")
-        else: st.write(f"🐻 Ожидается давление вниз к ${max_pain:,.0f}")
-
-else:
-    st.error("Не удалось получить данные от биржи. Проверьте соединение.")
+    # --- ГРАФИК 2: GEX И PAIN ---
+    c1, c2 = st.columns
