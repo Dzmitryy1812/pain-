@@ -505,94 +505,100 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
 
 
-# --- 8. POLYMARKET AUTO-CHECKER ---
+# --- 8. POLYMARKET AUTO-CHECKER (IMPROVED) ---
 st.divider()
 st.markdown("### 🔗 Блок 8: Проверка цен Polymarket")
 
 poly_url = st.text_input(
-    "Вставь ссылку на событие Polymarket (например, https://polymarket.com/event/bitcoin-price-march-28)",
+    "Вставь ссылку на событие",
+    value="https://polymarket.com/event/bitcoin-above-on-march-24",
     placeholder="https://polymarket.com/event/..."
 )
 
-if st.button("🔍 Проверить цены", use_container_width=True):
+if st.button("🔍 Проверить цены и синхронизировать", use_container_width=True):
     if not poly_url:
         st.error("Сначала вставь ссылку!")
     else:
         try:
-            # 1. Парсим slug из ссылки
+            # 1. Извлекаем slug правильно
             slug = poly_url.rstrip('/').split('/')[-1]
-            api_url = f"https://gamma-api.polymarket.com/events/{slug}"
             
-            with st.spinner("Синхронизация с Polymarket..."):
-                r = requests.get(api_url, timeout=10).json()
+            # 2. Используем правильный эндпоинт фильтрации по slug
+            api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
             
-            markets_data = r.get("markets", [])
+            with st.spinner("Синхронизация с API Polymarket..."):
+                response = requests.get(api_url, timeout=10).json()
+            
+            # API возвращает список событий, берем первое
+            if isinstance(response, list) and len(response) > 0:
+                event_data = response[0]
+                markets_data = event_data.get("markets", [])
+            else:
+                st.error("Событие не найдено. Проверь, что ссылка ведет на /event/...")
+                st.stop()
             
             if not markets_data:
-                st.warning("Рынки не найдены. Проверь ссылку.")
+                st.warning("В этом событии не найдено активных рынков.")
             else:
-                st.info(f"Найдено рынков в событии: {len(markets_data)}")
+                found_low_val = None
+                found_high_val = None
                 
-                # Словари для найденных совпадений
-                found_low = None
-                found_high = None
+                # Список всех страйков в событии для отладки
+                all_strikes_found = []
 
                 for m in markets_data:
                     q = m.get("question", "").lower()
-                    tokens = m.get("tokens", [])
-                    if len(tokens) < 2: continue
-                    
-                    yes_price = float(tokens[0].get("price", 0))
-                    no_price = float(tokens[1].get("price", 0))
+                    # Ищем цену YES в поле outcomePrices (обычно это список ["0.80", "0.20"])
+                    prices = m.get("outcomePrices", ["0.5", "0.5"])
+                    yes_price = float(prices[0])
+                    no_price = float(prices[1])
 
-                    # Извлекаем число из вопроса (например "above $66,000")
+                    # Извлекаем число (страйк)
                     import re
-                    match = re.search(r'\$?([\d,]+)', q)
+                    # Ищет числа с запятыми или без, после которых может быть k
+                    match = re.search(r'([\d,]+)\s*k?', q)
                     if match:
-                        strike_val = int(match.group(1).replace(',', ''))
-                        
-                        # Ищем нижний барьер (нам нужен YES на Above)
-                        if strike_val == p_low_strike and "above" in q:
-                            found_low = yes_price
-                        
-                        # Ищем верхний барьер (нам нужен NO на Above)
-                        if strike_val == p_high_strike and "above" in q:
-                            found_high = no_price
+                        num_str = match.group(1).replace(',', '')
+                        curr_strike = int(float(num_str) * 1000) if 'k' in q else int(num_str)
+                        all_strikes_found.append(f"{curr_strike} ({'Above' if 'above' in q else 'Below'})")
 
-                # Вывод результатов и обновление глобальных переменных
-                col_l, col_r = st.columns(2)
-                
-                with col_l:
-                    if found_low is not None:
-                        st.metric(f"Нижний {int_to_k(p_low_strike)} (YES)", f"${found_low:.2f}")
-                        # Обновляем значение для расчетов в блоке 6 и 7
-                        st.session_state.p_low_price = found_low
-                    else:
-                        st.error(f"Барьер {p_low_strike} 'Above' не найден")
+                        # Сверяем с нашими барьерами из сайдбара
+                        # Для нижнего: ищем Above [Low Strike] -> берем YES
+                        if curr_strike == p_low_strike and "above" in q:
+                            found_low_val = yes_price
+                        
+                        # Для верхнего: ищем Above [High Strike] -> берем NO 
+                        # (т.к. NO на "Будет выше 74к" это и есть "Будет НИЖЕ 74к")
+                        if curr_strike == p_high_strike and "above" in q:
+                            found_high_val = no_price
+                        
+                        # Если на Полимаркете вдруг рынок "Below [High Strike]" -> берем YES
+                        if curr_strike == p_high_strike and "below" in q:
+                            found_high_val = yes_price
 
-                with col_r:
-                    if found_high is not None:
-                        st.metric(f"Верхний {int_to_k(p_high_strike)} (NO)", f"${found_high:.2f}")
-                        # Обновляем значение для расчетов в блоке 6 и 7
-                        st.session_state.p_high_price = found_high
-                    else:
-                        st.error(f"Барьер {p_high_strike} 'Above' не найден")
+                # Вывод результатов
+                st.write(f"📊 Проверено рынков в событии: {len(markets_data)}")
                 
-                if found_low and found_high:
-                    st.success("✅ Цены успешно подтянуты и будут использованы в промпте!")
-                    st.rerun() # Перезапуск, чтобы Edge пересчитался везде
+                c1, c2 = st.columns(2)
+                with c1:
+                    if found_low_val is not None:
+                        st.metric(f"Нижний {int_to_k(p_low_strike)} (YES)", f"${found_low_val:.2f}")
+                        st.session_state.p_low_price = found_low_val
+                    else:
+                        st.error(f"Барьер {p_low_strike} не найден.")
+                        st.caption(f"В событии есть: {', '.join(set(all_strikes_found))}")
+
+                with c2:
+                    if found_high_val is not None:
+                        st.metric(f"Верхний {int_to_k(p_high_strike)} (NO)", f"${found_high_val:.2f}")
+                        st.session_state.p_high_price = found_high_val
+                    else:
+                        st.error(f"Барьер {p_high_strike} не найден.")
+                
+                if found_low_val and found_high_val:
+                    st.success("✅ Цены обновлены! Теперь они подставятся в Промпт для ИИ.")
+                    # Даем сайдбару знать, что нужно перерисоваться
+                    st.rerun()
 
         except Exception as e:
-            st.error(f"Ошибка при связи с Polymarket: {e}")
-
-# Чтобы значения из Блока 8 попадали в расчеты, 
-# убедись, что переменные p_low_price и p_high_price 
-# в начале кода берутся из session_state, если они там есть:
-if "p_low_price" not in st.session_state:
-    st.session_state.p_low_price = 0.85 # дефолт
-if "p_high_price" not in st.session_state:
-    st.session_state.p_high_price = 0.85 # дефолт
-
-# В блоке расчетов (Блок 6) используй именно эти значения:
-p_low_price = st.session_state.p_low_price
-p_high_price = st.session_state.p_high_price
+            st.error(f"Критическая ошибка: {e}")
