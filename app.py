@@ -212,7 +212,7 @@ st.metric("GEX внутри диапазона", f"{gex_inside:,.0f}",
           "✅ MM держит" if gex_inside > 0 else "❌ MM не держит")
 st.metric("GEX снаружи диапазона", f"{gex_outside:,.0f}",
           "✅ Барьеры защищены" if gex_outside < 0 else "⚠️ Возможен пробой")
-📋 Шпаргалка одной таблицей
+# Шпаргалка одной таблицей
 x_range = [spot_price * (1 - zoom / 100), spot_price * (1 + zoom / 100)]
 TRANSPARENT = "rgba(0,0,0,0)"
 
