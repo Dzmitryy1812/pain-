@@ -145,11 +145,53 @@ def get_options_data() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# --- 4. БОКОВАЯ ПАНЕЛЬ ---
+# --- 4. БОКОВАЯ ПАНЕЛЬ И ПАРСЕР POLYMARKET ---
+import json
+import re
+
+# Вспомогательная функция для загрузки конкретной цены из Polymarket
+def get_poly_price_for_strike(poly_url, target_strike, price_type="YES"):
+    slug = (poly_url or "").strip().rstrip("/").split("/")[-1]
+    if not slug: return None
+    try:
+        r = requests.get(f"https://gamma-api.polymarket.com/events?slug={slug}", timeout=5)
+        if r.status_code != 200: return None
+        data = r.json()
+        markets = data[0].get("markets", [])
+        
+        best_diff = float('inf')
+        best_price = None
+        
+        for m in markets:
+            q = m.get("question", "")
+            m_match = re.search(r"\$?\s*([\d]{2,3}[,\s]*[\d]{3})", q)
+            if not m_match: continue
+            
+            lvl = int(m_match.group(1).replace(",", "").replace(" ", ""))
+            diff = abs(lvl - target_strike)
+            
+            if diff <= 1000 and diff < best_diff:  # Допуск 1000$ к страйку
+                best_diff = diff
+                prices = m.get("outcomePrices", ["0", "0"])
+                if isinstance(prices, str):
+                    try: prices = json.loads(prices)
+                    except: prices = ["0", "0"]
+                
+                # YES = [0], NO = [1]
+                idx = 0 if price_type == "YES" else 1
+                try: best_price = float(prices[idx])
+                except: best_price = 0.0
+                
+        if best_diff != float('inf'):
+            return best_price
+    except:
+        pass
+    return None
+
+# Инициализация дефолтов
 spot_price, current_dvol, price_source = get_market_data()
 df_options = get_options_data()
 
-# session defaults for barriers (persist across reruns)
 if "p_low_strike" not in st.session_state:
     st.session_state.p_low_strike = int(round((spot_price - 3000) / 1000) * 1000)
 if "p_high_strike" not in st.session_state:
@@ -160,49 +202,81 @@ with st.sidebar:
     st.caption(f"Источник: {price_source}")
     st.caption(f"DVOL: {current_dvol:.1f}%")
 
-    if st.button("🔄 Обновить", use_container_width=True):
+    if st.button("🔄 Обновить данные рынка", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
     st.divider()
-    st.markdown("### 🎯 Барьеры Polymarket (формат: 78k)")
+    st.markdown("### 🎯 Барьеры Polymarket")
     
-    low_in = st.text_input(
-        "Нижний барьер",
-        value=int_to_k(st.session_state.p_low_strike),
-        key="low_k_input",
+    # Ссылка на Polymarket теперь тоже в сайдбаре!
+    poly_url = st.text_input(
+        "Ссылка на событие (Polymarket):", 
+        value="https://polymarket.com/event/bitcoin-above-on-march-24",
+        help="Вставь ссылку на страницу события, чтобы кнопки 🔄 могли подтянуть цены"
     )
-    p_low_price = st.slider("YES-цена снизу", 0.01, 0.99, key="p_low_price")
+    
+    # --- НИЖНИЙ БАРЬЕР ---
+    low_in = st.text_input("Нижний барьер (формат: 65k)", value=int_to_k(st.session_state.p_low_strike))
+    
+    # Колонки: слева слайдер, справа кнопка
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        val_low = st.session_state.pop("force_low", st.session_state.get("last_low", 0.5))
+        p_low_price = st.slider("YES-цена снизу", 0.01, 0.99, float(val_low))
+        st.session_state.last_low = p_low_price
+    with col2:
+        st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True) # выравнивание по высоте
+        if st.button("🔄", key="btn_get_low", help="Получить YES-цену с Polymarket"):
+            tgt = int(round(k_to_int(low_in) / 1000) * 1000)
+            with st.spinner(""):
+                new_p = get_poly_price_for_strike(poly_url, tgt, "YES")
+            if new_p is not None:
+                st.session_state.force_low = new_p
+                st.rerun()
+            else:
+                st.toast(f"❌ Рынок для {tgt}$ не найден (допуск ±1000$)", icon="⚠️")
 
-    high_in = st.text_input(
-        "Верхний барьер",
-        value=int_to_k(st.session_state.p_high_strike),
-        key="high_k_input",
-    )
-    p_high_price = st.slider("NO-цена сверху", 0.01, 0.99, key="p_high_price")
+    # --- ВЕРХНИЙ БАРЬЕР ---
+    high_in = st.text_input("Верхний барьер (формат: 75k)", value=int_to_k(st.session_state.p_high_strike))
+    
+    # Колонки: слева слайдер, справа кнопка
+    col3, col4 = st.columns([5, 1])
+    with col3:
+        val_high = st.session_state.pop("force_high", st.session_state.get("last_high", 0.5))
+        p_high_price = st.slider("NO-цена сверху", 0.01, 0.99, float(val_high))
+        st.session_state.last_high = p_high_price
+    with col4:
+        st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
+        if st.button("🔄", key="btn_get_high", help="Получить NO-цену с Polymarket"):
+            tgt = int(round(k_to_int(high_in) / 1000) * 1000)
+            with st.spinner(""):
+                new_p = get_poly_price_for_strike(poly_url, tgt, "NO")
+            if new_p is not None:
+                st.session_state.force_high = new_p
+                st.rerun()
+            else:
+                st.toast(f"❌ Рынок для {tgt}$ не найден (допуск ±1000$)", icon="⚠️")
 
-    # parse + snap to 1000
+    # --- ВАЛИДАЦИЯ И ПРОВЕРКИ ---
     low_ok, high_ok = True, True
     try:
         st.session_state.p_low_strike = int(round(k_to_int(low_in) / 1000) * 1000)
-    except Exception:
+    except:
         low_ok = False
-        st.warning("Нижний барьер: введи число или формат 78k")
 
     try:
         st.session_state.p_high_strike = int(round(k_to_int(high_in) / 1000) * 1000)
-    except Exception:
+    except:
         high_ok = False
-        st.warning("Верхний барьер: введи число или формат 66k")
 
-    # apply + basic validation
     p_low_strike = int(st.session_state.p_low_strike)
     p_high_strike = int(st.session_state.p_high_strike)
 
     if low_ok and high_ok and p_low_strike >= p_high_strike:
-        st.error("Диапазон неверный: нижний барьер должен быть меньше верхнего.")
+        st.error("Диапазон неверный: нижний барьер должен быть меньше.")
     else:
-        st.caption(f"Текущие: низ {int_to_k(p_low_strike)} (${p_low_strike:,}) / верх {int_to_k(p_high_strike)} (${p_high_strike:,})")
+        st.caption(f"Твой коридор: {p_low_strike:,}$ — {p_high_strike:,}$")
 
     st.divider()
     use_atm_iv = st.toggle("IV: ATM mark_iv (Deribit)", value=True)
@@ -210,7 +284,7 @@ with st.sidebar:
     r = r_pct / 100.0
 
     user_iv = st.slider("IV вручную (%)", 10, 150, int(current_dvol)) / 100
-    zoom = st.slider("Масштаб (%)", 5, 50, 20)
+    zoom = st.slider("Масштаб графика (%)", 5, 50, 20)
 # --- 5. ОСНОВНОЙ ЭКРАН ---
 st.title("⚡ BTC Alpha Terminal")
 
