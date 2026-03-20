@@ -56,6 +56,15 @@ def calc_max_pain(df_exp: pd.DataFrame):
     best_idx = int(np.argmin(pains))
     return strikes, pains, float(strikes[best_idx])
 
+def k_to_int(s: str) -> int:
+    s = s.strip().lower().replace(" ", "")
+    if s.endswith("k"):
+        return int(float(s[:-1]) * 1000)
+    return int(float(s))
+
+def int_to_k(x: int) -> str:
+    return f"{int(x)//1000}k"
+
 # --- 3. ЗАГРУЗКА ДАННЫХ ---
 @st.cache_data(ttl=15)
 def get_market_data():
@@ -135,6 +144,12 @@ def get_options_data() -> pd.DataFrame:
 spot_price, current_dvol, price_source = get_market_data()
 df_options = get_options_data()
 
+# session defaults for barriers (persist across reruns)
+if "p_low_strike" not in st.session_state:
+    st.session_state.p_low_strike = int(round((spot_price - 3000) / 1000) * 1000)
+if "p_high_strike" not in st.session_state:
+    st.session_state.p_high_strike = int(round((spot_price + 3000) / 1000) * 1000)
+
 with st.sidebar:
     st.markdown(f"### 💰 BTC: ${spot_price:,.1f}")
     st.caption(f"Источник: {price_source}")
@@ -145,12 +160,43 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.markdown("### 🎯 Барьеры Polymarket")
-    p_low_strike = st.number_input("Нижний барьер ($)", value=int(spot_price - 3000), step=500)
-    p_low_price  = st.slider("YES-цена снизу", 0.01, 0.99, 0.85)
+    st.markdown("### 🎯 Барьеры Polymarket (формат: 78k)")
+    low_in = st.text_input(
+        "Нижний барьер",
+        value=int_to_k(st.session_state.p_low_strike),
+        key="low_k_input",
+    )
+    p_low_price = st.slider("YES-цена снизу", 0.01, 0.99, 0.85)
 
-    p_high_strike = st.number_input("Верхний барьер ($)", value=int(spot_price + 3000), step=500)
-    p_high_price  = st.slider("NO-цена сверху", 0.01, 0.99, 0.85)
+    high_in = st.text_input(
+        "Верхний барьер",
+        value=int_to_k(st.session_state.p_high_strike),
+        key="high_k_input",
+    )
+    p_high_price = st.slider("NO-цена сверху", 0.01, 0.99, 0.85)
+
+    # parse + snap to 1000
+    low_ok, high_ok = True, True
+    try:
+        st.session_state.p_low_strike = int(round(k_to_int(low_in) / 1000) * 1000)
+    except Exception:
+        low_ok = False
+        st.warning("Нижний барьер: введи число или формат 78k")
+
+    try:
+        st.session_state.p_high_strike = int(round(k_to_int(high_in) / 1000) * 1000)
+    except Exception:
+        high_ok = False
+        st.warning("Верхний барьер: введи число или формат 66k")
+
+    # apply + basic validation
+    p_low_strike = int(st.session_state.p_low_strike)
+    p_high_strike = int(st.session_state.p_high_strike)
+
+    if low_ok and high_ok and p_low_strike >= p_high_strike:
+        st.error("Диапазон неверный: нижний барьер должен быть меньше верхнего.")
+    else:
+        st.caption(f"Текущие: низ {int_to_k(p_low_strike)} (${p_low_strike:,}) / верх {int_to_k(p_high_strike)} (${p_high_strike:,})")
 
     st.divider()
     use_atm_iv = st.toggle("IV: ATM mark_iv (Deribit)", value=True)
@@ -158,7 +204,7 @@ with st.sidebar:
     r = r_pct / 100.0
 
     user_iv = st.slider("IV вручную (%)", 10, 150, int(current_dvol)) / 100
-    zoom    = st.slider("Масштаб (%)", 5, 50, 20)
+    zoom = st.slider("Масштаб (%)", 5, 50, 20)
 
 # --- 5. ОСНОВНОЙ ЭКРАН ---
 st.title("⚡ BTC Alpha Terminal")
@@ -173,10 +219,10 @@ expiries_list = sorted(
 )
 selected_exp = st.selectbox("📅 Экспирация:", expiries_list)
 
-df  = df_options[df_options["exp"] == selected_exp].copy()
+df = df_options[df_options["exp"] == selected_exp].copy()
 dt_exp = parse_expiry(selected_exp)
 
-# ATM IV (ближайший страйк к споту)
+# ATM IV (ближайший страйк к споту) для выбранной экспирации
 if not df.empty:
     df["dist"] = (df["strike"] - spot_price).abs()
     atm_iv = float(df.sort_values("dist").iloc[0]["iv"])
@@ -195,7 +241,7 @@ T_years = max(
 ) / (365 * 24 * 3600)
 
 # Вероятности (BSM risk-neutral)
-prob_above_low  = lognormal_prob_above(spot_price, p_low_strike,  iv_used, T_years, r=r)
+prob_above_low = lognormal_prob_above(spot_price, p_low_strike, iv_used, T_years, r=r)
 prob_below_high = lognormal_prob_below(spot_price, p_high_strike, iv_used, T_years, r=r)
 
 # Расчёты
@@ -213,12 +259,12 @@ df_agg = (
     .agg(oi=("oi", "sum"), volume=("volume", "sum"), gex=("gex", "sum"))
     .reset_index()
 )
+
 gex_inside = df_agg[
     (df_agg["strike"] >= p_low_strike) &
     (df_agg["strike"] <= p_high_strike)
 ]["gex"].sum()
 
-# Суммарный GEX снаружи
 gex_outside = df_agg[
     (df_agg["strike"] < p_low_strike) |
     (df_agg["strike"] > p_high_strike)
@@ -239,7 +285,7 @@ st.metric(
 # Шпаргалка одной таблицей
 x_range = [spot_price * (1 - zoom / 100), spot_price * (1 + zoom / 100)]
 
-# --- Светлая тема графиков ---
+# --- Светлая тема 그래фиков ---
 PLOT_BG = "#FFFFFF"
 PAPER_BG = "#FFFFFF"
 GRID = "rgba(15, 23, 42, 0.10)"
@@ -318,14 +364,14 @@ with c2:
 st.divider()
 st.markdown("### 📊 Анализ барьеров")
 
-edge_l = prob_above_low  - p_low_price
+edge_l = prob_above_low - p_low_price
 edge_h = prob_below_high - p_high_price
 
 col1, col2 = st.columns(2)
 
 with col1:
     st.metric(
-        label=f"Нижний барьер ${p_low_strike:,}",
+        label=f"Нижний барьер {int_to_k(p_low_strike)} (${p_low_strike:,})",
         value=f"Модель: {prob_above_low*100:.1f}%",
         delta=f"Edge: {edge_l*100:+.1f}%",
     )
@@ -336,7 +382,7 @@ with col1:
 
 with col2:
     st.metric(
-        label=f"Верхний барьер ${p_high_strike:,}",
+        label=f"Верхний барьер {int_to_k(p_high_strike)} (${p_high_strike:,})",
         value=f"Модель: {prob_below_high*100:.1f}%",
         delta=f"Edge: {edge_h*100:+.1f}%",
     )
