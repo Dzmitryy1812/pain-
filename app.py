@@ -164,8 +164,9 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-  st.divider()
+    st.divider()
     st.markdown("### 🎯 Барьеры Polymarket (формат: 78k)")
+    
     low_in = st.text_input(
         "Нижний барьер",
         value=int_to_k(st.session_state.p_low_strike),
@@ -210,7 +211,6 @@ with st.sidebar:
 
     user_iv = st.slider("IV вручную (%)", 10, 150, int(current_dvol)) / 100
     zoom = st.slider("Масштаб (%)", 5, 50, 20)
-
 # --- 5. ОСНОВНОЙ ЭКРАН ---
 st.title("⚡ BTC Alpha Terminal")
 
