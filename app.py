@@ -510,25 +510,28 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
 
 
-# --- 8. POLYMARKET SCANNER (FINAL) ---
+# --- 8. POLYMARKET SCANNER (под твои барьеры: low->YES, high->NO) ---
+# Правило:
+#   - нижний барьер (меньшее значение)  => берем YES цену
+#   - верхний барьер (большее значение) => берем NO цену
+# Блок находит в событии рынки с уровнем $... равным этим барьерам (с допуском)
+# и при желании автоподставляет цены в st.session_state.
+
+import json
+import re
 import requests
 import pandas as pd
 import streamlit as st
-import json
-import re
 
 st.divider()
-st.header("🔗 Блок 8: Сканер Polymarket")
+st.header("🔗 Блок 8: Сканер Polymarket (low=YES, high=NO)")
 
 def parse_slug(url: str) -> str:
-    # https://polymarket.com/event/bitcoin-above-on-march-24 -> bitcoin-above-on-march-24
     url = (url or "").strip()
     return url.rstrip("/").split("/")[-1]
 
 def parse_outcome_prices(market: dict) -> tuple[float, float]:
     prices = market.get("outcomePrices", ["0", "0"])
-
-    # бывает строкой вида '["0.63","0.37"]'
     if isinstance(prices, str):
         try:
             prices = json.loads(prices)
@@ -544,46 +547,70 @@ def parse_outcome_prices(market: dict) -> tuple[float, float]:
         except Exception:
             return 0.0
 
-    return to_float(prices[0]), to_float(prices[1])
+    return to_float(prices[0]), to_float(prices[1])  # YES, NO
 
-def extract_strike(question: str):
-    """
-    Пытаемся вытащить число после $ (страйк).
-    Пример вопросов: "Will BTC be above $70,000 on March 24?"
-    """
+def extract_usd_level(question: str):
+    """Извлекает первое число после $: '$70,000' -> 70000"""
     q = question or ""
-
-    m1 = re.search(r"\$\s*([0-9][0-9,\. ]*)", q)  # после $
-    if not m1:
+    m = re.search(r"\$\s*([0-9][0-9,\. ]*)", q)
+    if not m:
         return None
-
-    raw = m1.group(1).replace(",", "").replace(" ", "")
+    raw = m.group(1).replace(",", "").replace(" ", "")
     try:
-        return float(raw)
-    except ValueError:
+        return int(float(raw))
+    except Exception:
         return None
 
+def pick_best_market(markets_rows: list[dict], target_level: int, tolerance: int):
+    """
+    Выбираем рынок, у которого level ближе всего к target_level в пределах tolerance.
+    Возвращает row или None.
+    """
+    best = None
+    best_dist = None
+    for row in markets_rows:
+        lvl = row.get("level")
+        if lvl is None:
+            continue
+        dist = abs(int(lvl) - int(target_level))
+        if dist <= int(tolerance) and (best is None or dist < best_dist):
+            best = row
+            best_dist = dist
+    return best
+
+# UI
 poly_url = st.text_input(
-    "Вставь ссылку на событие (event)",
-    value="https://polymarket.com/event/bitcoin-above-on-march-24"
+    "Ссылка на событие (event)",
+    value="https://polymarket.com/event/bitcoin-above-on-march-24",
+    key="poly_url_block8",
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    show_raw = st.checkbox("Показать raw из API", value=False)
-with col2:
-    only_with_strike = st.checkbox("Только рынки со страйком ($...)", value=False)
+c1, c2, c3 = st.columns([1, 1, 1])
+with c1:
+    tolerance = st.number_input("Допуск к страйку ($)", 0, 5000, 0, 500)
+with c2:
+    autoload = st.checkbox("Автоподставить цены в сайдбар", value=True)
+with c3:
+    show_table = st.checkbox("Показать таблицу всех рынков", value=False)
 
-if st.button("🚀 Найти страйки в событии", type="primary", use_container_width=True):
+if st.button("🚀 Подтянуть цены под барьеры", type="primary", use_container_width=True):
     try:
+        # p_low_strike / p_high_strike должны быть определены в твоём коде (сайдбар)
+        low_strike = int(p_low_strike)
+        high_strike = int(p_high_strike)
+
+        if low_strike >= high_strike:
+            st.error("Неверный диапазон: low_strike должен быть меньше high_strike.")
+            st.stop()
+
         slug = parse_slug(poly_url)
         if not slug:
-            st.error("Вставь корректную ссылку на event.")
+            st.error("Некорректная ссылка.")
             st.stop()
 
         api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
 
-        with st.spinner("Загрузка данных из API..."):
+        with st.spinner("Загрузка из Gamma API..."):
             r = requests.get(api_url, timeout=15)
             r.raise_for_status()
             data = r.json()
@@ -594,52 +621,58 @@ if st.button("🚀 Найти страйки в событии", type="primary",
 
         event = data[0]
         markets = event.get("markets", []) or []
-
-        st.success(f"Найдено рынков: {len(markets)}")
-
-        if show_raw:
-            st.json(event)
+        st.success(f"Рынков в событии: {len(markets)}")
 
         rows = []
         for m in markets:
             q = (m.get("question") or "").strip()
+            level = extract_usd_level(q)
             yes_p, no_p = parse_outcome_prices(m)
-            strike = extract_strike(q)
-
-            if only_with_strike and strike is None:
-                continue
-
             rows.append({
                 "question": q,
-                "strike": strike,
-                "yes": yes_p,
-                "no": no_p,
+                "level": level,
+                "YES": yes_p,
+                "NO": no_p,
                 "market_id": m.get("id"),
-                "condition_id": m.get("conditionId"),
                 "active": m.get("active"),
                 "closed": m.get("closed"),
                 "volume": m.get("volume"),
                 "liquidity": m.get("liquidity"),
             })
 
-        df = pd.DataFrame(rows)
+        # выбираем наиболее подходящие рынки под low/high
+        best_low = pick_best_market(rows, low_strike, int(tolerance))
+        best_high = pick_best_market(rows, high_strike, int(tolerance))
 
-        if not df.empty:
-            # если strike есть — удобно сортировать
-            if "strike" in df.columns:
-                df = df.sort_values(["strike", "yes"], ascending=[True, False], na_position="last")
+        st.subheader("🎯 Результат под твои барьеры")
 
-            st.dataframe(df, use_container_width=True)
-
-            st.download_button(
-                "⬇️ Скачать CSV",
-                df.to_csv(index=False).encode("utf-8"),
-                file_name=f"polymarket_{slug}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
+        if best_low and best_low.get("level") is not None and abs(best_low["level"] - low_strike) <= int(tolerance):
+            low_yes = float(best_low["YES"])
+            st.success(f"LOW {low_strike:,} → берём YES: {low_yes:.3f}  | рынок: {best_low['question']}")
         else:
-            st.warning("Ничего не найдено по выбранным фильтрам.")
+            st.error(f"Не найден рынок под LOW {low_strike:,} (±{int(tolerance)}$).")
+            low_yes = None
+
+        if best_high and best_high.get("level") is not None and abs(best_high["level"] - high_strike) <= int(tolerance):
+            high_no = float(best_high["NO"])
+            st.success(f"HIGH {high_strike:,} → берём NO: {high_no:.3f}  | рынок: {best_high['question']}")
+        else:
+            st.error(f"Не найден рынок под HIGH {high_strike:,} (±{int(tolerance)}$).")
+            high_no = None
+
+        # автоподстановка в session_state (чтобы расчёты использовали эти значения)
+        if autoload:
+            if low_yes is not None:
+                st.session_state.p_low_price = low_yes
+            if high_no is not None:
+                st.session_state.p_high_price = high_no
+            if (low_yes is not None) or (high_no is not None):
+                st.info("Цены записаны в st.session_state: p_low_price (YES) и p_high_price (NO).")
+                st.rerun()
+
+        if show_table:
+            df_all = pd.DataFrame(rows).sort_values(["level"], na_position="last")
+            st.dataframe(df_all, use_container_width=True)
 
     except requests.exceptions.RequestException as e:
         st.error(f"Ошибка сети/API: {e}")
