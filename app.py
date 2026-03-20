@@ -186,11 +186,14 @@ else:
         fig3.add_trace(go.Scatter(x=st_pain, y=val_pain, fill='tozeroy', line_color='#BA55D3', name="Loss Curve"))
         add_market_lines(fig3)
         
-        # Линия Max Pain (Красная, жирная, сплошная)
-        fig3.add_vline(x=max_pain, line_dash="solid", line_width=4, line_color="#FF0000", annotation_font_color="#FF0000")
-        
-        fig3.update_layout(height=350, xaxis_range=[spot_price * (1 - zoom/100), spot_price * (1 + zoom/100)])
-        st.plotly_chart(fig3, use_container_width=True)
+        # Линия Max Pain (Красная, жирная, сплошная, БЕЗ надписи)
+        fig3.add_vline(
+            x=max_pain, 
+            line_dash="solid", 
+            line_width=4, 
+            line_color="#FF0000", 
+            annotation_text=""  # Явно гасим любой текст
+        )
 
     # --- ФИНАЛЬНЫЙ АНАЛИЗ ---
     st.divider()
