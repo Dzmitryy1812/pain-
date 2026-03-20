@@ -502,3 +502,97 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
     st.success("✅ Промпт сгенерирован! Нажми на иконку копирования в правом верхнем углу блока ниже:")
     st.code(prompt_text, language="markdown")
+
+
+
+# --- 8. POLYMARKET AUTO-CHECKER ---
+st.divider()
+st.markdown("### 🔗 Блок 8: Проверка цен Polymarket")
+
+poly_url = st.text_input(
+    "Вставь ссылку на событие Polymarket (например, https://polymarket.com/event/bitcoin-price-march-28)",
+    placeholder="https://polymarket.com/event/..."
+)
+
+if st.button("🔍 Проверить цены", use_container_width=True):
+    if not poly_url:
+        st.error("Сначала вставь ссылку!")
+    else:
+        try:
+            # 1. Парсим slug из ссылки
+            slug = poly_url.rstrip('/').split('/')[-1]
+            api_url = f"https://gamma-api.polymarket.com/events/{slug}"
+            
+            with st.spinner("Синхронизация с Polymarket..."):
+                r = requests.get(api_url, timeout=10).json()
+            
+            markets_data = r.get("markets", [])
+            
+            if not markets_data:
+                st.warning("Рынки не найдены. Проверь ссылку.")
+            else:
+                st.info(f"Найдено рынков в событии: {len(markets_data)}")
+                
+                # Словари для найденных совпадений
+                found_low = None
+                found_high = None
+
+                for m in markets_data:
+                    q = m.get("question", "").lower()
+                    tokens = m.get("tokens", [])
+                    if len(tokens) < 2: continue
+                    
+                    yes_price = float(tokens[0].get("price", 0))
+                    no_price = float(tokens[1].get("price", 0))
+
+                    # Извлекаем число из вопроса (например "above $66,000")
+                    import re
+                    match = re.search(r'\$?([\d,]+)', q)
+                    if match:
+                        strike_val = int(match.group(1).replace(',', ''))
+                        
+                        # Ищем нижний барьер (нам нужен YES на Above)
+                        if strike_val == p_low_strike and "above" in q:
+                            found_low = yes_price
+                        
+                        # Ищем верхний барьер (нам нужен NO на Above)
+                        if strike_val == p_high_strike and "above" in q:
+                            found_high = no_price
+
+                # Вывод результатов и обновление глобальных переменных
+                col_l, col_r = st.columns(2)
+                
+                with col_l:
+                    if found_low is not None:
+                        st.metric(f"Нижний {int_to_k(p_low_strike)} (YES)", f"${found_low:.2f}")
+                        # Обновляем значение для расчетов в блоке 6 и 7
+                        st.session_state.p_low_price = found_low
+                    else:
+                        st.error(f"Барьер {p_low_strike} 'Above' не найден")
+
+                with col_r:
+                    if found_high is not None:
+                        st.metric(f"Верхний {int_to_k(p_high_strike)} (NO)", f"${found_high:.2f}")
+                        # Обновляем значение для расчетов в блоке 6 и 7
+                        st.session_state.p_high_price = found_high
+                    else:
+                        st.error(f"Барьер {p_high_strike} 'Above' не найден")
+                
+                if found_low and found_high:
+                    st.success("✅ Цены успешно подтянуты и будут использованы в промпте!")
+                    st.rerun() # Перезапуск, чтобы Edge пересчитался везде
+
+        except Exception as e:
+            st.error(f"Ошибка при связи с Polymarket: {e}")
+
+# Чтобы значения из Блока 8 попадали в расчеты, 
+# убедись, что переменные p_low_price и p_high_price 
+# в начале кода берутся из session_state, если они там есть:
+if "p_low_price" not in st.session_state:
+    st.session_state.p_low_price = 0.85 # дефолт
+if "p_high_price" not in st.session_state:
+    st.session_state.p_high_price = 0.85 # дефолт
+
+# В блоке расчетов (Блок 6) используй именно эти значения:
+p_low_price = st.session_state.p_low_price
+p_high_price = st.session_state.p_high_price
