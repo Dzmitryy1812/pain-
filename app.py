@@ -147,14 +147,17 @@ else:
     col4.metric("ДО ЗАКРЫТИЯ", f"{hours_to_exp/24:.1f} дн.")
     col5.metric("СУТОЧНЫЙ ОБЪЕМ", f"{df['volume'].sum():,.0f} BTC")
 
-    # --- ФУНКЦИЯ ДЛЯ ДОБАВЛЕНИЯ БАРЬЕРОВ НА ГРАФИКИ ---
+    # --- ФУНКЦИЯ ДЛЯ ДОБАВЛЕНИЯ БАРЬЕРОВ И ЗЕЛЕНОЙ ЗОНЫ НА ГРАФИКИ ---
     def add_market_lines(fig):
-        # Текущая цена (Черная)
+        # Светло-зеленая заливка между барьерами (Целевая зона Polymarket)
+        fig.add_vrect(x0=p_low_strike, x1=p_high_strike, fillcolor="#90EE90", opacity=0.2, layer="below", line_width=0)
+        
+        # Текущая цена (Черный пунктир)
         fig.add_vline(x=spot_price, line_dash="dash", line_color="black", annotation_text=" SPOT ", annotation_font_color="black")
-        # Нижний барьер Polymarket (Красная пунктирная)
-        fig.add_vline(x=p_low_strike, line_dash="dot", line_width=2, line_color="#DC143C", annotation_text=" БАРЬЕР НИЗ ", annotation_font_color="#DC143C")
-        # Верхний барьер Polymarket (Красная пунктирная)
-        fig.add_vline(x=p_high_strike, line_dash="dot", line_width=2, line_color="#DC143C", annotation_text=" БАРЬЕР ВЕРХ ", annotation_font_color="#DC143C")
+        
+        # Линии барьеров без надписей
+        fig.add_vline(x=p_low_strike, line_dash="dot", line_width=2, line_color="#DC143C")
+        fig.add_vline(x=p_high_strike, line_dash="dot", line_width=2, line_color="#DC143C")
 
     # --- ГРАФИК 1: ОБЪЕМ VS OI ---
     st.markdown("#### 🌊 Объемы торгов и Открытый интерес")
@@ -162,7 +165,6 @@ else:
     fig1.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['oi'], name="Накопленный OI", marker_color='rgba(65, 105, 225, 0.6)'))
     fig1.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['volume'], name="Объем 24ч", marker_color='#FFA500'))
     add_market_lines(fig1)
-    # Используем стандартную светлую тему
     fig1.update_layout(height=400, barmode='group', xaxis_range=[spot_price * (1 - zoom/100), spot_price * (1 + zoom/100)])
     st.plotly_chart(fig1, use_container_width=True)
 
@@ -172,7 +174,6 @@ else:
     with chart_col1:
         st.markdown("#### 🛡️ Gamma Exposure (Стенки ликвидности)")
         fig2 = go.Figure()
-        # Цвета мягче для светлой темы
         colors = ['#32CD32' if val > 0 else '#FF4500' for val in df_agg['gex']]
         fig2.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['gex'], marker_color=colors))
         add_market_lines(fig2)
@@ -182,10 +183,12 @@ else:
     with chart_col2:
         st.markdown("#### 🧲 Max Pain Curve (Зона убытков)")
         fig3 = go.Figure()
-        # Линия Max Pain теперь фиолетовая, чтобы было видно на белом
-        fig3.add_trace(go.Scatter(x=st_pain, y=val_pain, fill='tozeroy', line_color='#BA55D3', name="Pain"))
-        fig3.add_vline(x=max_pain, line_dash="dash", line_width=2, line_color="#800080", annotation_text=" MAX PAIN ", annotation_font_color="#800080")
+        fig3.add_trace(go.Scatter(x=st_pain, y=val_pain, fill='tozeroy', line_color='#BA55D3', name="Loss Curve"))
         add_market_lines(fig3)
+        
+        # Линия Max Pain (Красная, жирная, сплошная)
+        fig3.add_vline(x=max_pain, line_dash="solid", line_width=4, line_color="#FF0000", annotation_text=" MAX PAIN ", annotation_font_color="#FF0000")
+        
         fig3.update_layout(height=350, xaxis_range=[spot_price * (1 - zoom/100), spot_price * (1 + zoom/100)])
         st.plotly_chart(fig3, use_container_width=True)
 
