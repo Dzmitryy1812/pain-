@@ -10,27 +10,36 @@ from scipy.stats import norm
 # --- 1. ПАРАМЕТРЫ СТРАНИЦЫ ---
 st.set_page_config(page_title="BTC Alpha Terminal", page_icon="⚡", layout="wide")
 
-# --- 2. НАДЕЖНОЕ ПОЛУЧЕНИЕ ДАННЫХ ---
-@st.cache_data(ttl=30)
+# --- 2. ПОЛУЧЕНИЕ ДАННЫХ (BYBIT ПЕРВЫЙ) ---
+@st.cache_data(ttl=10) # Обновление цены каждые 10 секунд
 def get_market_data():
     price = 70000.0
     source = "Fallback (Error)"
     
+    # 1. BYBIT (Теперь основной)
     try:
-        res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3).json()
-        price = float(res['price'])
-        source = "Binance"
+        res = requests.get("https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT", timeout=3).json()
+        price = float(res['result']['list'][0]['lastPrice'])
+        source = "Bybit (Primary)"
     except:
+        # 2. BINANCE (Резервный)
         try:
-            res = requests.get("https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT", timeout=3).json()
-            price = float(res['result']['list'][0]['lastPrice'])
-            source = "Bybit"
+            res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3).json()
+            price = float(res['price'])
+            source = "Binance (Backup)"
         except:
-            source = "Deribit Fallback"
-            
+            # 3. DERIBIT (Запасной)
+            try:
+                res = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", timeout=3).json()
+                price = float(res['result']['index_price'])
+                source = "Deribit (Backup)"
+            except:
+                pass
+
+    # Волатильность DVOL (только Deribit)
     try:
-        req_dvol = requests.get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1", timeout=5).json()
-        dvol = float(req_dvol['result']['data'][-1][3])
+        req_v = requests.get("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC&resolution=1", timeout=5).json()
+        dvol = float(req_v['result']['data'][-1][3])
     except:
         dvol = 55.0
 
@@ -79,101 +88,99 @@ spot_price, current_dvol, price_source = get_market_data()
 df_options = get_options_data()
 
 with st.sidebar:
-    st.markdown("### 📊 Данные рынка")
-    st.metric("Цена BTC", f"${spot_price:,.0f}")
-    st.caption(f"Источник: {price_source} | IV: {current_dvol:.1f}%")
+    st.markdown(f"### 💰 BTC Price: ${spot_price:,.1f}")
+    st.caption(f"Источник: {price_source}")
+    st.caption(f"Волатильность (DVOL): {current_dvol:.1f}%")
     
-    if st.button("🔄 Обновить данные", use_container_width=True):
+    if st.button("🔄 ОБНОВИТЬ ЦЕНУ", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
     
     st.divider()
     st.markdown("### 🎯 Барьеры Polymarket")
     p_low_strike = st.number_input("НИЖНИЙ барьер", value=int(spot_price - 3000), step=500)
-    p_low_price = st.slider("Цена YES порог", 0.01, 0.99, 0.85)
+    p_low_price = st.slider("Цена YES снизу", 0.01, 0.99, 0.85)
     
     p_high_strike = st.number_input("ВЕРХНИЙ барьер", value=int(spot_price + 3000), step=500)
-    p_high_price = st.slider("Цена NO порог", 0.01, 0.99, 0.85)
+    p_high_price = st.slider("Цена NO сверху", 0.01, 0.99, 0.85)
 
     st.divider()
     user_iv = st.slider("Рабочая IV (%)", 10, 150, int(current_dvol)) / 100
     zoom = st.slider("Масштаб графиков (%)", 5, 50, 20)
 
 # --- 5. ОСНОВНОЙ ЭКРАН ---
-st.title("⚡ BTC Alpha Pro Terminal")
+st.title("⚡ BTC Alpha Terminal (Bybit Driven)")
 
 if df_options.empty:
-    st.error("Данные не загружены.")
+    st.error("Ошибка загрузки книги опционов.")
 else:
     expiries_list = sorted(df_options['exp'].unique(), key=lambda x: datetime.strptime(x, "%d%b%y"))
-    selected_exp = st.selectbox("📅 Выберите дату экспирации:", expiries_list)
+    selected_exp = st.selectbox("📅 Срок экспирации:", expiries_list)
     
     df = df_options[df_options['exp'] == selected_exp].copy()
     dt_exp = datetime.strptime(selected_exp, "%d%b%y").replace(tzinfo=timezone.utc) + timedelta(hours=8)
     T_years = max((dt_exp - datetime.now(timezone.utc)).total_seconds() / 3600, 0.1) / (24 * 365)
 
+    # Вероятности
     std_dev = user_iv * math.sqrt(T_years)
     prob_above_low = 1 - norm.cdf((math.log(p_low_strike / spot_price) + 0.5 * std_dev**2) / std_dev)
     prob_below_high = norm.cdf((math.log(p_high_strike / spot_price) + 0.5 * std_dev**2) / std_dev)
 
+    # Расчеты
     st_pain, val_pain, max_pain = calc_max_pain(df)
-    df['gamma'] = df.apply(lambda row: calc_gamma(spot_price, row['strike'], user_iv, T_years), axis=1)
-    df['gex'] = df.apply(lambda row: row['oi'] * row['gamma'] * (spot_price**2) * 0.01 * (1 if row['type'] == 'C' else -1), axis=1)
+    df['gamma'] = df.apply(lambda r: calc_gamma(spot_price, r['strike'], user_iv, T_years), axis=1)
+    df['gex'] = df.apply(lambda r: r['oi'] * r['gamma'] * (spot_price**2) * 0.01 * (1 if r['type'] == 'C' else -1), axis=1)
     df_agg = df.groupby('strike').agg({'oi': 'sum', 'volume': 'sum', 'gex': 'sum'}).reset_index()
 
-    # --- МЕТРИКИ ---
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("MAX PAIN", f"${max_pain:,.0f}")
-    col2.metric(f"Шанс > {p_low_strike}", f"{prob_above_low*100:.1f}%")
-    col3.metric(f"Шанс < {p_high_strike}", f"{prob_below_high*100:.1f}%")
-    col4.metric("ДО ЗАКРЫТИЯ", f"{(T_years*365):.1f} дн.")
-    col5.metric("VOLUME", f"{df['volume'].sum():,.0f}")
-
-    # --- ФУНКЦИЯ ДЛЯ ГРАФИКОВ ---
-    def add_market_lines(fig):
-        # Зеленая подложка
-        fig.add_vrect(x0=p_low_strike, x1=p_high_strike, fillcolor="#90EE90", opacity=0.15, layer="below", line_width=0)
-        # Цена (Пунктир)
+    # Построение графиков
+    def add_market_layout(fig):
+        # Зеленая зона выделения
+        fig.add_vrect(x0=p_low_strike, x1=p_high_strike, fillcolor="#90EE90", opacity=0.2, layer="below", line_width=0)
+        # Спот цена (Пунктир без текста)
         fig.add_vline(x=spot_price, line_dash="dash", line_color="black", annotation_text="")
-        # Барьеры (Точки)
-        fig.add_vline(x=p_low_strike, line_dash="dot", line_width=1, line_color="#DC143C", annotation_text="")
-        fig.add_vline(x=p_high_strike, line_dash="dot", line_width=1, line_color="#DC143C", annotation_text="")
+        # Границы барьеров
+        fig.add_vline(x=p_low_strike, line_dash="dot", line_width=2, line_color="#DC143C", annotation_text="")
+        fig.add_vline(x=p_high_strike, line_dash="dot", line_width=2, line_color="#DC143C", annotation_text="")
 
-    # --- ГРАФИК 1 ---
+    # График 1
     st.markdown("#### 🌊 Объемы и OI")
     fig1 = go.Figure()
-    fig1.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['oi'], name="OI", marker_color='rgba(65, 105, 225, 0.6)'))
-    fig1.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['volume'], name="Vol", marker_color='#FFA500'))
-    add_market_lines(fig1)
-    fig1.update_layout(height=380, barmode='group', xaxis_range=[spot_price*(1-zoom/100), spot_price*(1+zoom/100)], margin=dict(l=0, r=0, t=30, b=0))
+    fig1.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['oi'], name="OI", marker_color='rgba(65, 105, 225, 0.5)'))
+    fig1.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['volume'], name="Volume", marker_color='orange'))
+    add_market_layout(fig1)
+    fig1.update_layout(height=400, barmode='group', xaxis_range=[spot_price*(1-zoom/100), spot_price*(1+zoom/100)], paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
     st.plotly_chart(fig1, use_container_width=True)
 
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("#### 🛡️ GEX Profile")
+        st.markdown("#### 🛡️ GEX (Ликвидность)")
         fig2 = go.Figure()
-        fig2.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['gex'], marker_color=['#32CD32' if v > 0 else '#FF4500' for v in df_agg['gex']]))
-        add_market_lines(fig2)
-        fig2.update_layout(height=350, xaxis_range=[spot_price*(1-zoom/100), spot_price*(1+zoom/100)], margin=dict(l=0, r=0, t=30, b=0))
+        colors = ['#32CD32' if v > 0 else '#FF4500' for v in df_agg['gex']]
+        fig2.add_trace(go.Bar(x=df_agg['strike'], y=df_agg['gex'], marker_color=colors))
+        add_market_layout(fig2)
+        fig2.update_layout(height=350, xaxis_range=[spot_price*(1-zoom/100), spot_price*(1+zoom/100)], paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig2, use_container_width=True)
     
     with c2:
         st.markdown("#### 🧲 Max Pain Curve")
         fig3 = go.Figure()
-        # Линия убытков: Красная, Сплошная, Жирная
-        fig3.add_trace(go.Scatter(x=st_pain, y=val_pain, fill='tozeroy', line=dict(color='#FF0000', width=4), name="Loss"))
-        add_market_lines(fig3)
-        # Вертикаль Max Pain: Красная Жирная
-        fig3.add_vline(x=max_pain, line_dash="solid", line_width=3, line_color="#FF0000", annotation_text="")
-        fig3.update_layout(height=350, xaxis_range=[spot_price*(1-zoom/100), spot_price*(1+zoom/100)], margin=dict(l=0, r=0, t=30, b=0))
+        # Линия убытков КРАСНАЯ ТОЛСТАЯ
+        fig3.add_trace(go.Scatter(x=st_pain, y=val_pain, fill='tozeroy', line=dict(color='red', width=5), name="Loss"))
+        add_market_layout(fig3)
+        # Вертикальная линия Max Pain ТОЛСТАЯ КРАСНАЯ
+        fig3.add_vline(x=max_pain, line_dash="solid", line_width=4, line_color="red", annotation_text="")
+        fig3.update_layout(height=350, xaxis_range=[spot_price*(1-zoom/100), spot_price*(1+zoom/100)], paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig3, use_container_width=True)
 
+    # Вердикт
     st.divider()
     edge_l, edge_h = prob_above_low - p_low_price, prob_below_high - p_high_price
     r1, r2 = st.columns(2)
     with r1:
-        if edge_l > 0.03: st.success(f"✅ Low Barrier Edge: {edge_l*100:.1f}%")
-        else: st.error(f"❌ Low Barrier Edge: {edge_l*100:.1f}%")
+        msg = f"Edge: **{edge_l*100:.1f}%**"
+        if edge_l > 0.03: st.success(f"✅ Low Barrier выгодный! {msg}")
+        else: st.error(f"❌ Low Barrier дорогой! {msg}")
     with r2:
-        if edge_h > 0.03: st.success(f"✅ High Barrier Edge: {edge_h*100:.1f}%")
-        else: st.error(f"❌ High Barrier Edge: {edge_h*100:.1f}%")
+        msg = f"Edge: **{edge_h*100:.1f}%**"
+        if edge_h > 0.03: st.success(f"✅ High Barrier выгодный! {msg}")
+        else: st.error(f"❌ High Barrier дорогой! {msg}")
