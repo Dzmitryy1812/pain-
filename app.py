@@ -511,84 +511,137 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
 
 # --- 8. POLYMARKET SCANNER (FINAL) ---
+import requests
+import pandas as pd
+import streamlit as st
+import json
+import re
+
 st.divider()
 st.header("🔗 Блок 8: Сканер Polymarket")
 
-poly_url = st.text_input("Вставь ссылку", value="https://polymarket.com/event/bitcoin-above-on-march-24")
+def parse_slug(url: str) -> str:
+    # https://polymarket.com/event/bitcoin-above-on-march-24 -> bitcoin-above-on-march-24
+    url = (url or "").strip()
+    return url.rstrip("/").split("/")[-1]
+
+def parse_outcome_prices(market: dict) -> tuple[float, float]:
+    prices = market.get("outcomePrices", ["0", "0"])
+
+    # бывает строкой вида '["0.63","0.37"]'
+    if isinstance(prices, str):
+        try:
+            prices = json.loads(prices)
+        except Exception:
+            prices = ["0", "0"]
+
+    if not isinstance(prices, (list, tuple)) or len(prices) < 2:
+        prices = ["0", "0"]
+
+    def to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    return to_float(prices[0]), to_float(prices[1])
+
+def extract_strike(question: str):
+    """
+    Пытаемся вытащить число после $ (страйк).
+    Пример вопросов: "Will BTC be above $70,000 on March 24?"
+    """
+    q = question or ""
+
+    m1 = re.search(r"\$\s*([0-9][0-9,\. ]*)", q)  # после $
+    if not m1:
+        return None
+
+    raw = m1.group(1).replace(",", "").replace(" ", "")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+poly_url = st.text_input(
+    "Вставь ссылку на событие (event)",
+    value="https://polymarket.com/event/bitcoin-above-on-march-24"
+)
+
+col1, col2 = st.columns(2)
+with col1:
+    show_raw = st.checkbox("Показать raw из API", value=False)
+with col2:
+    only_with_strike = st.checkbox("Только рынки со страйком ($...)", value=False)
 
 if st.button("🚀 Найти страйки в событии", type="primary", use_container_width=True):
     try:
-        slug = poly_url.rstrip("/").split("/")[-1]
+        slug = parse_slug(poly_url)
+        if not slug:
+            st.error("Вставь корректную ссылку на event.")
+            st.stop()
+
         api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
 
         with st.spinner("Загрузка данных из API..."):
-            res = requests.get(api_url, timeout=10)
-            res.raise_for_status()
-            data = res.json()
+            r = requests.get(api_url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
 
         if not data or not isinstance(data, list):
-            st.error("❌ API вернул неожиданный формат данных.")
+            st.error("API вернул неожиданный формат данных.")
             st.stop()
 
         event = data[0]
         markets = event.get("markets", []) or []
-        st.write(f"✅ Успешно! Найдено инструментов в ссылке: {len(markets)}")
 
-        found_data = []
+        st.success(f"Найдено рынков: {len(markets)}")
+
+        if show_raw:
+            st.json(event)
+
+        rows = []
         for m in markets:
             q = (m.get("question") or "").strip()
-            prices = m.get("outcomePrices", ["0", "0"])
+            yes_p, no_p = parse_outcome_prices(m)
+            strike = extract_strike(q)
 
-            # outcomePrices иногда приходит как строка JSON
-            if isinstance(prices, str):
-                import json
-                try:
-                    prices = json.loads(prices)
-                except Exception:
-                    prices = ["0", "0"]
+            if only_with_strike and strike is None:
+                continue
 
-            # Нормализация и защита от кривых данных
-            if not isinstance(prices, (list, tuple)) or len(prices) < 2:
-                prices = ["0", "0"]
+            rows.append({
+                "question": q,
+                "strike": strike,
+                "yes": yes_p,
+                "no": no_p,
+                "market_id": m.get("id"),
+                "condition_id": m.get("conditionId"),
+                "active": m.get("active"),
+                "closed": m.get("closed"),
+                "volume": m.get("volume"),
+                "liquidity": m.get("liquidity"),
+            })
 
-            try:
-                y = float(prices[0])  # YES
-            except Exception:
-                y = 0.0
-            try:
-                n = float(prices[1])  # NO
-            except Exception:
-                n = 0.0
+        df = pd.DataFrame(rows)
 
-            # Достаём "страйк" из вопроса: "... above $70,000 on March 24?"
-            import re
-            m_strike = re.search(r"\$?\s*([\d{1,3}(?:[,\s]\d{3})*]+)", q)
-            strike = None
-            if m_strike:
-                raw = m_strike.group(1)
-                strike = float(raw.replace(",", "").replace(" ", "")) if raw else None
+        if not df.empty:
+            # если strike есть — удобно сортировать
+            if "strike" in df.columns:
+                df = df.sort_values(["strike", "yes"], ascending=[True, False], na_position="last")
 
-            found_data.append(
-                {
-                    "question": q,
-                    "strike": strike,
-                    "yes": y,
-                    "no": n,
-                    "market_id": m.get("id"),
-                    "condition_id": m.get("conditionId"),
-                }
+            st.dataframe(df, use_container_width=True)
+
+            st.download_button(
+                "⬇️ Скачать CSV",
+                df.to_csv(index=False).encode("utf-8"),
+                file_name=f"polymarket_{slug}.csv",
+                mime="text/csv",
+                use_container_width=True
             )
-
-        import pandas as pd
-
-        df = pd.DataFrame(found_data)
-        # сортируем по страйку, если он есть
-        if "strike" in df.columns:
-            df = df.sort_values(by="strike", na_position="last")
-
-        st.dataframe(df, use_container_width=True)
+        else:
+            st.warning("Ничего не найдено по выбранным фильтрам.")
 
     except requests.exceptions.RequestException as e:
-        st.error(f"❌ Ошибка сети/API: {e}")
+        st.error(f"Ошибка сети/API: {e}")
     except Exception as e:
-        st.error(f"❌ Непредвиденная ошибка: {e}")
+        st.error(f"Непредвиденная ошибка: {e}")
