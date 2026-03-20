@@ -22,16 +22,16 @@ def parse_expiry(exp_str: str) -> datetime:
             continue
     raise ValueError(f"Неизвестный формат даты: {exp_str}")
 
-def lognormal_prob_above(S: float, K: float, iv: float, T: float) -> float:
+def lognormal_prob_above(S: float, K: float, iv: float, T: float, r: float = 0.0) -> float:
     """P(S_T > K) — риск-нейтральная вероятность (формула N(d2) из BSM)."""
     if S <= 0 or K <= 0 or iv <= 0 or T <= 0:
         return 0.0
-    d2 = (math.log(S / K) - 0.5 * iv**2 * T) / (iv * math.sqrt(T))
+    d2 = (math.log(S / K) + (r - 0.5 * iv**2) * T) / (iv * math.sqrt(T))
     return float(norm.cdf(d2))
 
-def lognormal_prob_below(S: float, K: float, iv: float, T: float) -> float:
+def lognormal_prob_below(S: float, K: float, iv: float, T: float, r: float = 0.0) -> float:
     """P(S_T < K)."""
-    return 1.0 - lognormal_prob_above(S, K, iv, T)
+    return 1.0 - lognormal_prob_above(S, K, iv, T, r=r)
 
 def calc_gamma(S: float, K: float, iv: float, T: float, r: float = 0.0) -> float:
     """BSM Gamma."""
@@ -153,7 +153,11 @@ with st.sidebar:
     p_high_price  = st.slider("NO-цена сверху", 0.01, 0.99, 0.85)
 
     st.divider()
-    user_iv = st.slider("Рабочая IV (%)", 10, 150, int(current_dvol)) / 100
+    use_atm_iv = st.toggle("IV: ATM mark_iv (Deribit)", value=True)
+    r_pct = st.slider("Ставка r (годовых, %)", 0.0, 20.0, 0.0, 0.25)
+    r = r_pct / 100.0
+
+    user_iv = st.slider("IV вручную (%)", 10, 150, int(current_dvol)) / 100
     zoom    = st.slider("Масштаб (%)", 5, 50, 20)
 
 # --- 5. ОСНОВНОЙ ЭКРАН ---
@@ -172,23 +176,36 @@ selected_exp = st.selectbox("📅 Экспирация:", expiries_list)
 df  = df_options[df_options["exp"] == selected_exp].copy()
 dt_exp = parse_expiry(selected_exp)
 
+# ATM IV (ближайший страйк к споту)
+if not df.empty:
+    df["dist"] = (df["strike"] - spot_price).abs()
+    atm_iv = float(df.sort_values("dist").iloc[0]["iv"])
+else:
+    atm_iv = user_iv
+
+iv_used = atm_iv if use_atm_iv else user_iv
+
+st.caption(
+    f"IV used: {iv_used*100:.1f}%  |  ATM IV: {atm_iv*100:.1f}%  |  Manual IV: {user_iv*100:.1f}%  |  r: {r_pct:.2f}%"
+)
+
 # Время до экспирации (минимум 5 минут)
 T_years = max(
     (dt_exp - datetime.now(timezone.utc)).total_seconds(), 300
 ) / (365 * 24 * 3600)
 
-# Вероятности (исправленная формула)
-prob_above_low  = lognormal_prob_above(spot_price, p_low_strike,  user_iv, T_years)
-prob_below_high = lognormal_prob_below(spot_price, p_high_strike, user_iv, T_years)
+# Вероятности (BSM risk-neutral)
+prob_above_low  = lognormal_prob_above(spot_price, p_low_strike,  iv_used, T_years, r=r)
+prob_below_high = lognormal_prob_below(spot_price, p_high_strike, iv_used, T_years, r=r)
 
 # Расчёты
 st_pain, val_pain, max_pain = calc_max_pain(df)
 
 df["gamma"] = df.apply(
-    lambda r: calc_gamma(spot_price, r["strike"], user_iv, T_years), axis=1
+    lambda rr: calc_gamma(spot_price, rr["strike"], iv_used, T_years, r=r), axis=1
 )
 df["gex"] = df.apply(
-    lambda r: r["oi"] * r["gamma"] * spot_price**2 * 0.01 * (1 if r["type"] == "C" else -1),
+    lambda rr: rr["oi"] * rr["gamma"] * spot_price**2 * 0.01 * (1 if rr["type"] == "C" else -1),
     axis=1,
 )
 df_agg = (
@@ -197,67 +214,88 @@ df_agg = (
     .reset_index()
 )
 gex_inside = df_agg[
-    (df_agg['strike'] >= p_low_strike) & 
-    (df_agg['strike'] <= p_high_strike)
-]['gex'].sum()
+    (df_agg["strike"] >= p_low_strike) &
+    (df_agg["strike"] <= p_high_strike)
+]["gex"].sum()
 
-# Суммарный GEX снаружи (барьеры ±10%)
+# Суммарный GEX снаружи
 gex_outside = df_agg[
-    (df_agg['strike'] < p_low_strike) | 
-    (df_agg['strike'] > p_high_strike)
-]['gex'].sum()
+    (df_agg["strike"] < p_low_strike) |
+    (df_agg["strike"] > p_high_strike)
+]["gex"].sum()
 
 # Вывод
-st.metric("GEX внутри диапазона", f"{gex_inside:,.0f}", 
-          "✅ MM держит" if gex_inside > 0 else "❌ MM не держит")
-st.metric("GEX снаружи диапазона", f"{gex_outside:,.0f}",
-          "✅ Барьеры защищены" if gex_outside < 0 else "⚠️ Возможен пробой")
+st.metric(
+    "GEX внутри диапазона (proxy)",
+    f"{gex_inside:,.0f}",
+    "✅ MM держит" if gex_inside > 0 else "❌ MM не держит",
+)
+st.metric(
+    "GEX снаружи диапазона (proxy)",
+    f"{gex_outside:,.0f}",
+    "✅ Барьеры защищены" if gex_outside < 0 else "⚠️ Возможен пробой",
+)
+
 # Шпаргалка одной таблицей
 x_range = [spot_price * (1 - zoom / 100), spot_price * (1 + zoom / 100)]
-TRANSPARENT = "rgba(0,0,0,0)"
 
+# --- Светлая тема графиков ---
+PLOT_BG = "#FFFFFF"
+PAPER_BG = "#FFFFFF"
+GRID = "rgba(15, 23, 42, 0.10)"
+FONT = "#0F172A"
 
+RANGE_FILL = "rgba(37, 99, 235, 0.10)"
+BARRIER = "#DC2626"
+SPOT = "#111827"
 
 def add_market_layout(fig: go.Figure) -> None:
     fig.add_vrect(
         x0=p_low_strike, x1=p_high_strike,
-        fillcolor="#90EE90", opacity=0.2, layer="below", line_width=0,
+        fillcolor=RANGE_FILL, opacity=1.0, layer="below", line_width=0,
     )
-    for x, color, dash in [
-        (spot_price,    "black",   "dash"),
-        (p_low_strike,  "#DC143C", "dot"),
-        (p_high_strike, "#DC143C", "dot"),
-    ]:
-        fig.add_vline(x=x, line_dash=dash, line_color=color, line_width=2)
+    fig.add_vline(x=spot_price, line_dash="dash", line_color=SPOT, line_width=2)
+    fig.add_vline(x=p_low_strike, line_dash="dot", line_color=BARRIER, line_width=2)
+    fig.add_vline(x=p_high_strike, line_dash="dot", line_color=BARRIER, line_width=2)
+
+def apply_light_layout(fig: go.Figure, height: int, x_range, barmode: str = None):
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        paper_bgcolor=PAPER_BG,
+        plot_bgcolor=PLOT_BG,
+        font=dict(color=FONT),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    fig.update_xaxes(range=x_range, showgrid=True, gridcolor=GRID, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=GRID, zeroline=False)
+    if barmode:
+        fig.update_layout(barmode=barmode)
 
 # График 1 — OI & Volume
 st.markdown("#### 🌊 OI и Объём")
 fig1 = go.Figure([
-    go.Bar(x=df_agg["strike"], y=df_agg["oi"],     name="OI",     marker_color="rgba(65,105,225,0.5)"),
-    go.Bar(x=df_agg["strike"], y=df_agg["volume"],  name="Volume", marker_color="orange"),
+    go.Bar(x=df_agg["strike"], y=df_agg["oi"],     name="OI",     marker_color="rgba(37, 99, 235, 0.45)"),
+    go.Bar(x=df_agg["strike"], y=df_agg["volume"], name="Volume", marker_color="rgba(245, 158, 11, 0.70)"),
 ])
 add_market_layout(fig1)
-fig1.update_layout(
-    height=400, barmode="group", xaxis_range=x_range,
-    paper_bgcolor=TRANSPARENT, plot_bgcolor=TRANSPARENT,
-)
+apply_light_layout(fig1, height=400, x_range=x_range, barmode="group")
 st.plotly_chart(fig1, use_container_width=True)
 
 c1, c2 = st.columns(2)
 
 with c1:
-    st.markdown("#### 🛡️ GEX")
+    st.markdown("#### 🛡️ GEX (proxy)")
     fig2 = go.Figure([
         go.Bar(
             x=df_agg["strike"], y=df_agg["gex"],
-            marker_color=["#32CD32" if v >= 0 else "#FF4500" for v in df_agg["gex"]],
+            marker_color=["rgba(34,197,94,0.75)" if v >= 0 else "rgba(239,68,68,0.75)" for v in df_agg["gex"]],
+            name="GEX",
         )
     ])
     add_market_layout(fig2)
-    fig2.update_layout(
-        height=350, xaxis_range=x_range,
-        paper_bgcolor=TRANSPARENT, plot_bgcolor=TRANSPARENT,
-    )
+    apply_light_layout(fig2, height=350, x_range=x_range)
     st.plotly_chart(fig2, use_container_width=True)
 
 with c2:
@@ -265,16 +303,15 @@ with c2:
     fig3 = go.Figure([
         go.Scatter(
             x=st_pain, y=val_pain, fill="tozeroy",
-            line=dict(color="red", width=3), name="Loss",
+            line=dict(color="rgba(220,38,38,0.95)", width=3), name="Loss",
         )
     ])
     add_market_layout(fig3)
-    fig3.add_vline(x=max_pain, line_dash="solid", line_width=3, line_color="red",
-                   annotation_text=f"MP: ${max_pain:,.0f}", annotation_position="top right")
-    fig3.update_layout(
-        height=350, xaxis_range=x_range,
-        paper_bgcolor=TRANSPARENT, plot_bgcolor=TRANSPARENT,
+    fig3.add_vline(
+        x=max_pain, line_dash="solid", line_width=3, line_color="rgba(220,38,38,0.95)",
+        annotation_text=f"MP: ${max_pain:,.0f}", annotation_position="top right"
     )
+    apply_light_layout(fig3, height=350, x_range=x_range)
     st.plotly_chart(fig3, use_container_width=True)
 
 # --- 6. ВЕРДИКТ ---
