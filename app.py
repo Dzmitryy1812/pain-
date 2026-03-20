@@ -164,21 +164,21 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.divider()
+  st.divider()
     st.markdown("### 🎯 Барьеры Polymarket (формат: 78k)")
     low_in = st.text_input(
         "Нижний барьер",
         value=int_to_k(st.session_state.p_low_strike),
         key="low_k_input",
     )
-   st.slider("YES-цена снизу", 0.01, 0.99, key="p_low_price")
+    p_low_price = st.slider("YES-цена снизу", 0.01, 0.99, key="p_low_price")
 
     high_in = st.text_input(
         "Верхний барьер",
         value=int_to_k(st.session_state.p_high_strike),
         key="high_k_input",
     )
-    st.slider("NO-цена сверху", 0.01, 0.99, key="p_high_price")
+    p_high_price = st.slider("NO-цена сверху", 0.01, 0.99, key="p_high_price")
 
     # parse + snap to 1000
     low_ok, high_ok = True, True
