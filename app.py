@@ -510,13 +510,7 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
 
 
-# --- 8. POLYMARKET SCANNER (под твои барьеры: low->YES, high->NO) ---
-# Правило:
-#   - нижний барьер (меньшее значение)  => берем YES цену
-#   - верхний барьер (большее значение) => берем NO цену
-# Блок находит в событии рынки с уровнем $... равным этим барьерам (с допуском)
-# и при желании автоподставляет цены в st.session_state.
-
+# --- 8. POLYMARKET SCANNER (LOW=YES, HIGH=NO) ---
 import json
 import re
 import requests
@@ -524,7 +518,7 @@ import pandas as pd
 import streamlit as st
 
 st.divider()
-st.header("🔗 Блок 8: Сканер Polymarket (low=YES, high=NO)")
+st.header("🔗 Блок 8: Сканер Polymarket (Подтягивает цены в сайдбар)")
 
 def parse_slug(url: str) -> str:
     url = (url or "").strip()
@@ -532,6 +526,7 @@ def parse_slug(url: str) -> str:
 
 def parse_outcome_prices(market: dict) -> tuple[float, float]:
     prices = market.get("outcomePrices", ["0", "0"])
+    
     if isinstance(prices, str):
         try:
             prices = json.loads(prices)
@@ -541,140 +536,120 @@ def parse_outcome_prices(market: dict) -> tuple[float, float]:
     if not isinstance(prices, (list, tuple)) or len(prices) < 2:
         prices = ["0", "0"]
 
-    def to_float(x):
-        try:
-            return float(x)
-        except Exception:
-            return 0.0
-
-    return to_float(prices[0]), to_float(prices[1])  # YES, NO
+    try:
+        y = float(prices[0])
+    except:
+        y = 0.0
+    try:
+        n = float(prices[1])
+    except:
+        n = 0.0
+        
+    return y, n
 
 def extract_usd_level(question: str):
-    """Извлекает первое число после $: '$70,000' -> 70000"""
+    """Ищет числа вида $70,000 или 65000 в вопросе"""
     q = question or ""
-    m = re.search(r"\$\s*([0-9][0-9,\. ]*)", q)
-    if not m:
-        return None
-    raw = m.group(1).replace(",", "").replace(" ", "")
-    try:
-        return int(float(raw))
-    except Exception:
-        return None
+    m = re.search(r"\$?\s*([\d]{2,3}[,\s]*[\d]{3})", q)
+    if m:
+        raw = m.group(1).replace(",", "").replace(" ", "")
+        try:
+            return int(raw)
+        except:
+            pass
+    return None
 
-def pick_best_market(markets_rows: list[dict], target_level: int, tolerance: int):
-    """
-    Выбираем рынок, у которого level ближе всего к target_level в пределах tolerance.
-    Возвращает row или None.
-    """
-    best = None
-    best_dist = None
-    for row in markets_rows:
-        lvl = row.get("level")
-        if lvl is None:
-            continue
-        dist = abs(int(lvl) - int(target_level))
-        if dist <= int(tolerance) and (best is None or dist < best_dist):
-            best = row
-            best_dist = dist
-    return best
-
-# UI
 poly_url = st.text_input(
     "Ссылка на событие (event)",
     value="https://polymarket.com/event/bitcoin-above-on-march-24",
-    key="poly_url_block8",
 )
 
-c1, c2, c3 = st.columns([1, 1, 1])
-with c1:
-    tolerance = st.number_input("Допуск к страйку ($)", 0, 5000, 0, 500)
-with c2:
-    autoload = st.checkbox("Автоподставить цены в сайдбар", value=True)
-with c3:
-    show_table = st.checkbox("Показать таблицу всех рынков", value=False)
+col1, col2 = st.columns([1, 1])
+with col1:
+    tolerance = st.number_input("Допуск к страйку ($)", 0, 10000, 1000, 500)
+with col2:
+    show_table = st.checkbox("Показать все рынки в таблице", value=True)
 
-if st.button("🚀 Подтянуть цены под барьеры", type="primary", use_container_width=True):
+if st.button("🚀 Найти и подставить цены в сайдбар", type="primary", use_container_width=True):
     try:
-        # p_low_strike / p_high_strike должны быть определены в твоём коде (сайдбар)
-        low_strike = int(p_low_strike)
-        high_strike = int(p_high_strike)
-
-        if low_strike >= high_strike:
-            st.error("Неверный диапазон: low_strike должен быть меньше high_strike.")
-            st.stop()
+        # Берем текущие выставленные барьеры
+        low_strike = int(st.session_state.p_low_strike)
+        high_strike = int(st.session_state.p_high_strike)
 
         slug = parse_slug(poly_url)
         if not slug:
-            st.error("Некорректная ссылка.")
+            st.error("Неверная ссылка.")
             st.stop()
 
         api_url = f"https://gamma-api.polymarket.com/events?slug={slug}"
 
-        with st.spinner("Загрузка из Gamma API..."):
-            r = requests.get(api_url, timeout=15)
+        with st.spinner("Загрузка данных Polymarket..."):
+            r = requests.get(api_url, timeout=10)
             r.raise_for_status()
             data = r.json()
 
         if not data or not isinstance(data, list):
-            st.error("API вернул неожиданный формат данных.")
+            st.error("Ошибка формата API.")
             st.stop()
 
-        event = data[0]
-        markets = event.get("markets", []) or []
-        st.success(f"Рынков в событии: {len(markets)}")
-
+        markets = data[0].get("markets", [])
+        
         rows = []
         for m in markets:
             q = (m.get("question") or "").strip()
             level = extract_usd_level(q)
             yes_p, no_p = parse_outcome_prices(m)
+            
             rows.append({
-                "question": q,
-                "level": level,
+                "Уровень": level,
+                "Вопрос": q,
                 "YES": yes_p,
-                "NO": no_p,
-                "market_id": m.get("id"),
-                "active": m.get("active"),
-                "closed": m.get("closed"),
-                "volume": m.get("volume"),
-                "liquidity": m.get("liquidity"),
+                "NO": no_p
             })
 
-        # выбираем наиболее подходящие рынки под low/high
-        best_low = pick_best_market(rows, low_strike, int(tolerance))
-        best_high = pick_best_market(rows, high_strike, int(tolerance))
+        df = pd.DataFrame(rows)
+        
+        # Поиск совпадений
+        best_low, best_low_diff = None, float('inf')
+        best_high, best_high_diff = None, float('inf')
 
-        st.subheader("🎯 Результат под твои барьеры")
+        for r in rows:
+            lvl = r["Уровень"]
+            if lvl is None:
+                continue
+                
+            diff_l = abs(lvl - low_strike)
+            if diff_l <= tolerance and diff_l < best_low_diff:
+                best_low, best_low_diff = r, diff_l
+                
+            diff_h = abs(lvl - high_strike)
+            if diff_h <= tolerance and diff_h < best_high_diff:
+                best_high, best_high_diff = r, diff_h
 
-        if best_low and best_low.get("level") is not None and abs(best_low["level"] - low_strike) <= int(tolerance):
-            low_yes = float(best_low["YES"])
-            st.success(f"LOW {low_strike:,} → берём YES: {low_yes:.3f}  | рынок: {best_low['question']}")
+        # Вывод и подстановка
+        updated = False
+        
+        if best_low:
+            st.session_state.p_low_price = float(best_low['YES'])
+            updated = True
+            st.success(f"🔽 LOW-Барьер: {low_strike:,} → Нашли [{best_low['Уровень']:,}] = Подставлено {best_low['YES']} YES")
         else:
-            st.error(f"Не найден рынок под LOW {low_strike:,} (±{int(tolerance)}$).")
-            low_yes = None
+            st.error(f"❌ Под LOW-барьер ({low_strike:,}) рынков не найдено.")
 
-        if best_high and best_high.get("level") is not None and abs(best_high["level"] - high_strike) <= int(tolerance):
-            high_no = float(best_high["NO"])
-            st.success(f"HIGH {high_strike:,} → берём NO: {high_no:.3f}  | рынок: {best_high['question']}")
+        if best_high:
+            st.session_state.p_high_price = float(best_high['NO'])
+            updated = True
+            st.success(f"🔼 HIGH-Барьер: {high_strike:,} → Нашли [{best_high['Уровень']:,}] = Подставлено {best_high['NO']} NO")
         else:
-            st.error(f"Не найден рынок под HIGH {high_strike:,} (±{int(tolerance)}$).")
-            high_no = None
-
-        # автоподстановка в session_state (чтобы расчёты использовали эти значения)
-        if autoload:
-            if low_yes is not None:
-                st.session_state.p_low_price = low_yes
-            if high_no is not None:
-                st.session_state.p_high_price = high_no
-            if (low_yes is not None) or (high_no is not None):
-                st.info("Цены записаны в st.session_state: p_low_price (YES) и p_high_price (NO).")
-                st.rerun()
+            st.error(f"❌ Под HIGH-барьер ({high_strike:,}) рынков не найдено.")
 
         if show_table:
-            df_all = pd.DataFrame(rows).sort_values(["level"], na_position="last")
-            st.dataframe(df_all, use_container_width=True)
+            st.dataframe(df.dropna(subset=["Уровень"]).sort_values("Уровень"), use_container_width=True)
 
-    except requests.exceptions.RequestException as e:
-        st.error(f"Ошибка сети/API: {e}")
+        if updated:
+            import time
+            time.sleep(1) # Даем пользователю секунду прочитать, что цены найдены
+            st.rerun()    # Перезагружаем интерфейс — ползунки сдвинутся!
+
     except Exception as e:
-        st.error(f"Непредвиденная ошибка: {e}")
+        st.error(f"Произошла ошибка: {e}")
