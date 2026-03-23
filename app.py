@@ -7,224 +7,204 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone, timedelta
 from scipy.stats import norm
 
-# --- КОНФИГУРАЦИЯ СТРАНИЦЫ ---
-st.set_page_config(page_title="Deribit BTC Options Pro", page_icon="🦇", layout="wide")
+st.set_page_config(page_title="BTC Analytics Radar", page_icon="🦇", layout="wide")
 
-# --- МАТЕМАТИКА: BLACK-SCHOLES & GREEKS ---
-def bsm_calculations(S, K, T, iv, r=0.0, option_type="C"):
-    if T <= 1e-6 or iv <= 1e-6:
-        return 0.0, 0.0, 0.0, 0.0
-    
+# --- 1. МАТЕМАТИКА BSM, GEX, MAX PAIN ---
+def bsm_greeks(S, K, T, iv, r=0.0):
+    if T <= 1e-6 or iv <= 1e-6: return 0.0, 0.0
     d1 = (np.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
-    d2 = d1 - iv * np.sqrt(T)
-    
-    # Гамма (одинаковая для Call и Put)
     gamma = norm.pdf(d1) / (S * iv * np.sqrt(T))
-    
-    if option_type == "C":
-        delta = norm.cdf(d1)
-        theta = -(S * norm.pdf(d1) * iv) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * norm.cdf(d2)
-        price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        delta = norm.cdf(d1) - 1
-        theta = -(S * norm.pdf(d1) * iv) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * norm.cdf(-d2)
-        price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-    
-    return delta, gamma, theta / 365, price
+    delta_c = norm.cdf(d1)
+    delta_p = delta_c - 1
+    return gamma, delta_c, delta_p
 
 def get_prob_inside(S, K_low, K_high, iv, T):
     if T <= 0: return 1.0 if K_low < S < K_high else 0.0
     def n_d2(K):
         d2 = (math.log(S / K) + (-0.5 * iv**2) * T) / (iv * math.sqrt(T))
         return norm.cdf(d2)
-    return n_d2(K_low) - n_d2(K_high)
+    return max(0.0, n_d2(K_low) - n_d2(K_high))
 
-# --- ПАРСЕР ДАТЫ (Deribit: 28MAR25) ---
-def parse_expiry(exp_str: str) -> datetime:
-    for fmt in ("%d%b%y", "%d%b%Y"):
-        try:
-            return datetime.strptime(exp_str, fmt).replace(tzinfo=timezone.utc) + timedelta(hours=8)
-        except ValueError:
-            continue
-    return datetime.now(timezone.utc)
+def calc_max_pain(df_exp):
+    strikes = sorted(df_exp["strike"].unique())
+    if not strikes: return [], [], 0
+    pains = []
+    calls = df_exp[df_exp["type"] == "C"]
+    puts  = df_exp[df_exp["type"] == "P"]
+    
+    for s in strikes:
+        loss = (
+            np.sum(np.maximum(0.0, s - calls["strike"]) * calls["oi"]) +
+            np.sum(np.maximum(0.0, puts["strike"] - s) * puts["oi"])
+        )
+        pains.append(loss)
+    best_idx = int(np.argmin(pains))
+    return strikes, pains, float(strikes[best_idx])
 
-# --- ЗАГРУЗКА ДАННЫХ DERIBIT (НЕТ БЛОКИРОВОК) ---
+# --- 2. ДАННЫЕ DERIBIT (НАДЕЖНО КАК ШВЕЙЦАРСКИЕ ЧАСЫ) ---
 @st.cache_data(ttl=30)
-def fetch_deribit_data():
+def fetch_global_options_data():
     try:
-        # 1. Загружаем Спот цены (Индекс Deribit)
-        idx_url = "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd"
-        r_idx = requests.get(idx_url, timeout=5).json()
+        r_idx = requests.get("https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd", timeout=5).json()
         spot = float(r_idx.get("result", {}).get("index_price", 0))
 
-        # 2. Загружаем всю доску опционов (Книга Deribit)
-        opt_url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
-        r_opt = requests.get(opt_url, timeout=10).json()
-        
+        r_opt = requests.get("https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option", timeout=10).json()
         data = []
         for item in r_opt.get("result", []):
-            sym = item.get("instrument_name", "") # формат: BTC-28MAR25-70000-C
+            sym = item.get("instrument_name", "")
             parts = sym.split("-")
             if len(parts) < 4: continue
-            
             data.append({
-                "symbol": sym,
                 "exp": parts[1],
                 "strike": float(parts[2]),
                 "type": parts[3],
-                "iv": float(item.get("mark_iv", 0) or 0) / 100.0, # На Deribit IV приходит как 55.5 (надо / 100)
-                "bid": float(item.get("best_bid_price", 0) or 0), # В BTC!
-                "ask": float(item.get("best_ask_price", 0) or 0), # В BTC!
-                "mark": float(item.get("mark_price", 0) or 0),    # В BTC!
+                "iv": float(item.get("mark_iv", 50) or 50) / 100.0,
                 "oi": float(item.get("open_interest", 0) or 0),
                 "vol": float(item.get("volume", 0) or 0)
             })
-            
         return spot, pd.DataFrame(data)
     except Exception as e:
-        st.error(f"Ошибка API Deribit: {e}")
+        st.error(f"Ошибка загрузки данных Deribit: {e}")
         return 0.0, pd.DataFrame()
 
-# --- ОСНОВНОЙ ИНТЕРФЕЙС ---
-st.title("🦇 Deribit BTC Alpha Terminal")
+def parse_expiry(exp_str):
+    for fmt in ("%d%b%y", "%d%b%Y"):
+        try: return datetime.strptime(exp_str, fmt).replace(tzinfo=timezone.utc) + timedelta(hours=8)
+        except ValueError: continue
+    return datetime.now(timezone.utc)
 
-spot_price, df_all = fetch_deribit_data()
+# --- 3. ИНТЕРФЕЙС И НАСТРОЙКИ ---
+st.title("🦇 Глобальный Радар Опционов (GEX & Max Pain)")
+st.caption("Данные Deribit. Используйте анализ для выбора страйков на Bybit.")
 
-if df_all.empty or spot_price == 0:
-    st.warning("⚠️ Не удалось загрузить данные с Deribit.")
+spot_price, df_all = fetch_global_options_data()
+
+if df_all.empty:
     st.stop()
 
-# --- САЙДБАР ---
 with st.sidebar:
-    st.markdown(f"## Spot BTC: **${spot_price:,.1f}**")
-    
+    st.markdown(f"## Spot: **${spot_price:,.0f}**")
     expiries = sorted(df_all["exp"].unique(), key=lambda x: parse_expiry(x))
-    selected_exp = st.selectbox("📅 Дата экспирации", expiries)
+    selected_exp = st.selectbox("📅 Экспирация (выбери как на Bybit)", expiries)
     
-    st.divider()
-    st.caption("Настройки модели BSM")
-    r_rate = st.number_input("Risk-free Rate (%)", 0.0, 15.0, 0.0) / 100
-    graph_zoom = st.slider("Зум графика PnL (%)", 5, 50, 15)
+    zoom = st.slider("Масштаб графиков (%)", 5, 50, 20)
     
-    if st.button("🔄 Обновить данные рынка", use_container_width=True):
+    if st.button("🔄 Обновить данные рынка"):
         st.cache_data.clear()
         st.rerun()
 
-# --- ПОДГОТОВКА И РАСЧЕТЫ ---
+# --- 4. РАСЧЕТЫ ДЛЯ ВЫБРАННОЙ ЭКСПИРАЦИИ ---
 df = df_all[df_all["exp"] == selected_exp].copy()
 dt_exp = parse_expiry(selected_exp)
-T_years = max((dt_exp - datetime.now(timezone.utc)).total_seconds(), 60) / (365 * 24 * 3600)
+T_years = max((dt_exp - datetime.now(timezone.utc)).total_seconds(), 300) / (365 * 24 * 3600)
 
-if df.empty:
-    st.error("Нет опционов на выбранную дату.")
-    st.stop()
-
-# Пересчет греков для доски
-df[['delta', 'gamma', 'theta', 'bs_price']] = df.apply(
-    lambda r: bsm_calculations(spot_price, r['strike'], T_years, r['iv'], r=r_rate, option_type=r['type']),
+# Применяем BSM
+df[['gamma', 'delta_c', 'delta_p']] = df.apply(
+    lambda r: bsm_greeks(spot_price, r['strike'], T_years, r['iv']), 
     axis=1, result_type='expand'
 )
-
-# GEX (Gamma Exposure) - прокси для выявления сильных уровней (стен MMs)
+df['delta'] = np.where(df['type'] == 'C', df['delta_c'], df['delta_p'])
 df['gex'] = df['oi'] * df['gamma'] * (spot_price**2) * 0.01 * np.where(df['type'] == 'C', 1, -1)
 
-# --- КОНСТРУКТОР СТРАТЕГИИ (SALE STRANGLE) ---
-st.subheader(f"📊 Построение коридора (Short Strangle) на {selected_exp}")
+strikes, pains, max_pain = calc_max_pain(df)
 
-calls = df[df['type'] == 'C']
-puts = df[df['type'] == 'P']
+# Достаем среднюю IV (ATM) для расчета вероятности общего движения
+atm_df = df.iloc[(df['strike'] - spot_price).abs().argsort()[:2]]
+atm_iv = atm_df['iv'].mean()
+expected_move = spot_price * atm_iv * np.sqrt(T_years)
 
-c1, c2 = st.columns(2)
-with c1:
-    put_strike = st.selectbox("Sell PUT (Нижняя граница поддержки)", sorted(puts['strike'].unique()), index=len(puts)//4)
-with c2:
-    call_strike = st.selectbox("Sell CALL (Верхняя граница сопротивления)", sorted(calls['strike'].unique(), reverse=True), index=len(calls)//4)
+# --- 5. ВЫБОР КОРИДОРА И АНАЛИТИКА ---
+st.subheader(f"🎯 Выбор барьеров на {selected_exp}")
 
-sel_put = puts[puts['strike'] == put_strike].iloc[0]
-sel_call = calls[calls['strike'] == call_strike].iloc[0]
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    low_strike = st.selectbox("Нижний барьер (Sell P)", sorted(df['strike'].unique()), index=max(0, len(df['strike'].unique())//2 - 5))
+with col2:
+    high_strike = st.selectbox("Верхний барьер (Sell C)", sorted(df['strike'].unique()), index=min(len(df['strike'].unique())-1, len(df['strike'].unique())//2 + 5))
+with col3:
+    prob_inside = get_prob_inside(spot_price, low_strike, high_strike, atm_iv, T_years)
+    st.metric("Матем. шанс флэта", f"{prob_inside*100:.1f}%", help="Вероятность по Black-Scholes, что цена останется между барьерами на дату экспирации.")
+with col4:
+    st.metric("Max Pain (Цель)", f"${max_pain:,.0f}", f"{(max_pain - spot_price)/spot_price*100:.1f}% от спота")
 
-# Расчет премии (Deribit номинирует премию в BTC)
-total_premium_btc = sel_put['bid'] + sel_call['bid']
-total_premium_usd = total_premium_btc * spot_price
+# Данные по конкретным страйкам
+opt_p = df[(df['strike'] == low_strike) & (df['type'] == 'P')]
+opt_c = df[(df['strike'] == high_strike) & (df['type'] == 'C')]
 
-# Экспозиция (мы продаем -> берем инвертированные греки)
-pos_delta = -(sel_put['delta'] + sel_call['delta'])
-pos_theta_usd = -(sel_put['theta'] + sel_call['theta']) * spot_price
+delta_p = opt_p['delta'].values[0] if not opt_p.empty else 0
+delta_c = opt_c['delta'].values[0] if not opt_c.empty else 0
 
-# --- МЕТРИКИ ---
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Собранная премия", f"${total_premium_usd:,.0f}", f"{total_premium_btc:.4f} BTC")
-m2.metric("Суммарная Дельта", f"{pos_delta:.3f}")
-m3.metric("Tetha (Доход в сутки)", f"${pos_theta_usd:,.2f}")
-prob_in = get_prob_inside(spot_price, put_strike, call_strike, (sel_put['iv']+sel_call['iv'])/2, T_years)
-m4.metric("Вероятность флэта (BSM)", f"{prob_in*100:.1f}%")
+st.info(f"🛡️ **Риск-профиль барьеров:** PUT {low_strike} имеет Дельту **{delta_p:.2f}** | CALL {high_strike} имеет Дельту **{delta_c:.2f}**. Ожидаемое отклонение цены (1 Sigma): **±${expected_move:,.0f}**.")
 
-# --- ГРАФИКИ ---
-col_left, col_right = st.columns([5, 3])
+# --- 6. ГРАФИКИ (РАДАР) ---
+x_min = spot_price * (1 - zoom/100)
+x_max = spot_price * (1 + zoom/100)
+df_agg = df.groupby("strike").agg({"oi": "sum", "vol": "sum", "gex": "sum"}).reset_index()
 
-with col_left:
-    st.markdown("#### 💸 Профиль прибыли (PnL на дату экспирации)")
-    x_pnl = np.linspace(spot_price * (1 - graph_zoom/100), spot_price * (1 + graph_zoom/100), 200)
-    y_pnl = []
-    
-    for x in x_pnl:
-        loss_p = max(0, put_strike - x)
-        loss_c = max(0, x - call_strike)
-        profit = total_premium_usd - (loss_p + loss_c)
-        y_pnl.append(profit)
-    
-    be_low = put_strike - total_premium_usd
-    be_high = call_strike + total_premium_usd
-    
-    fig_pnl = go.Figure()
-    fig_pnl.add_trace(go.Scatter(x=x_pnl, y=y_pnl, fill='tozeroy', name="PnL USD", line=dict(color='#00ff88', width=2)))
-    fig_pnl.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text=" Текущая цена")
-    fig_pnl.add_vline(x=put_strike, line_color="red", line_dash="dot", annotation_text=f"Sell Put {put_strike}")
-    fig_pnl.add_vline(x=call_strike, line_color="red", line_dash="dot", annotation_text=f"Sell Call {call_strike}")
-    
-    # Зеленая нулевая линия
-    fig_pnl.add_hline(y=0, line_width=1, line_color="gray")
-    fig_pnl.update_layout(template="plotly_dark", height=400, margin=dict(l=20, r=20, t=30, b=20))
-    st.plotly_chart(fig_pnl, use_container_width=True)
+# 1. GEX & MAX PAIN
+c_charts_1, c_charts_2 = st.columns(2)
 
-with col_right:
-    st.markdown("#### 🛡️ Уровни защиты MMs (GEX Walls)")
-    df_agg = df.groupby("strike")["gex"].sum().reset_index()
-    # Фильтруем график под зум
-    df_agg = df_agg[(df_agg['strike'] >= spot_price*(1-graph_zoom/100)) & (df_agg['strike'] <= spot_price*(1+graph_zoom/100))]
-    
-    colors = ['rgba(37, 99, 235, 0.8)' if x > 0 else 'rgba(239, 68, 68, 0.8)' for x in df_agg['gex']]
-    fig_gex = go.Figure(go.Bar(x=df_agg['gex'], y=df_agg['strike'], orientation='h', marker_color=colors))
-    fig_gex.add_hline(y=spot_price, line_dash="dash", line_color="white")
-    fig_gex.update_layout(template="plotly_dark", height=400, margin=dict(l=20, r=20, t=30, b=20))
+with c_charts_1:
+    st.markdown("#### 🧱 Gamma Exposure (Стены Маркетмейкеров)")
+    colors = ['rgba(34,197,94,0.7)' if x >= 0 else 'rgba(239,68,68,0.7)' for x in df_agg['gex']]
+    fig_gex = go.Figure(go.Bar(x=df_agg['strike'], y=df_agg['gex'], marker_color=colors))
+    fig_gex.add_vline(x=spot_price, line_dash="dash", line_color="white", annotation_text="Spot")
+    fig_gex.add_vline(x=low_strike, line_width=2, line_color="orange", annotation_text="Твой Пут")
+    fig_gex.add_vline(x=high_strike, line_width=2, line_color="orange", annotation_text="Твой Колл")
+    fig_gex.update_xaxes(range=[x_min, x_max])
+    fig_gex.update_layout(template="plotly_dark", height=350, margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig_gex, use_container_width=True)
 
-# Точки безубыточности под графиками
-st.info(f"📍 **Точки безубыточности (Breakevens):** Низ: **${be_low:,.0f}** | Верх: **${be_high:,.0f}**. Если цена закроется внутри, вы забираете 100% премии (${total_premium_usd:,.0f}).")
+with c_charts_2:
+    st.markdown("#### 🧲 График Max Pain (Зона притяжения)")
+    fig_pain = go.Figure(go.Scatter(x=strikes, y=pains, fill="tozeroy", line=dict(color="#8b5cf6", width=3)))
+    fig_pain.add_vline(x=max_pain, line_dash="solid", line_color="#8b5cf6", annotation_text=f"Max Pain: {max_pain}")
+    fig_pain.add_vline(x=low_strike, line_dash="dot", line_color="orange")
+    fig_pain.add_vline(x=high_strike, line_dash="dot", line_color="orange")
+    fig_pain.update_xaxes(range=[x_min, x_max])
+    fig_pain.update_layout(template="plotly_dark", height=350, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig_pain, use_container_width=True)
 
-# --- ОТЧЕТ ДЛЯ ИИ ---
+# 2. OI & VOLUME
+st.markdown("#### 🌊 Open Interest и Объемы (Ликвидность)")
+fig_oi = go.Figure([
+    go.Bar(x=df_agg['strike'], y=df_agg['oi'], name="Open Interest", marker_color="rgba(59, 130, 246, 0.6)"),
+    go.Bar(x=df_agg['strike'], y=df_agg['vol'], name="Volume", marker_color="rgba(245, 158, 11, 0.8)")
+])
+fig_oi.add_vline(x=low_strike, line_width=2, line_color="orange")
+fig_oi.add_vline(x=high_strike, line_width=2, line_color="orange")
+fig_oi.update_xaxes(range=[x_min, x_max])
+fig_oi.update_layout(template="plotly_dark", barmode="group", height=300, margin=dict(l=10, r=10, t=10, b=10))
+st.plotly_chart(fig_oi, use_container_width=True)
+
+# --- 7. ГЕНЕРАТОР ПРОМПТА ИИ ---
 st.divider()
-st.subheader("🧠 Генератор промпта для AI")
-if st.button("Сгенерировать сводку для ChatGPT / Claude", use_container_width=True):
-    report = f"""Ты — риск-менеджер криптофонда. Я планирую продать стрэнгл на Deribit.
-Оцени риски этой сделки, опираясь на макроэкономику и вероятность сильных движений.
+st.subheader("🤖 Генератор AI-Промпта для проверки коридора")
 
-[ПАРАМЕТРЫ СДЕЛКИ]
-- Базовый актив: BTC Spot = ${spot_price:,.0f}
-- Экспирация: {selected_exp} (Осталось: {T_years*365:.1f} дней)
-- Нижний барьер (Sell P): ${put_strike:,.0f}. IV: {sel_put['iv']*100:.1f}%
-- Верхний барьер (Sell C): ${call_strike:,.0f}. IV: {sel_call['iv']*100:.1f}%
+if st.button("Сгенерировать промпт для ChatGPT / Claude", use_container_width=True):
+    # Оцениваем GEX защиты
+    gex_low_defense = df_agg[(df_agg['strike'] < spot_price) & (df_agg['strike'] >= low_strike)]['gex'].sum()
+    gex_high_defense = df_agg[(df_agg['strike'] > spot_price) & (df_agg['strike'] <= high_strike)]['gex'].sum()
+    
+    prompt = f"""Ты — квант-аналитик крипто-опционов. Оцени надежность коридора страйков, который я хочу торговать на Bybit.
 
-[ФИНАНСЫ]
-- Собранная премия: ${total_premium_usd:,.0f}
-- Точки безубыточности (Breakevens): ${be_low:,.0f} — ${be_high:,.0f}
-- Суммарная Дельта: {pos_delta:.4f}
-- Суммарная Тета: ${pos_theta_usd:,.2f} USD распада в сутки
-- Модельная вероятность (BSM) удержания в диапазоне: {prob_in*100:.1f}%
+[ДАННЫЕ РЫНКА]
+- Базовый актив: BTC = ${spot_price:,.0f}
+- Ожидаемое отклонение (по ATM IV): ±${expected_move:,.0f} к дате экспирации.
+- Max Pain (точка минимальных выплат опционщиков): ${max_pain:,.0f}
 
-ЗАДАЧА:
-1. Оцени отношение Премии к Риску пробоя (выгодно ли это?).
-2. Какой из барьеров (нижний или верхний) сейчас выглядит более уязвимым?
-3. Скажи, нужны ли дельта-хеджирования при таком значении суммарной дельты.
+[МОЯ ПОЗИЦИЯ - КОРИДОР ДО {selected_exp}]
+- Нижний барьер (Sell Put): ${low_strike:,.0f} (Дельта: {delta_p:.2f})
+- Верхний барьер (Sell Call): ${high_strike:,.0f} (Дельта: {delta_c:.2f})
+- Математическая вероятность удержания: {prob_inside*100:.1f}%
+
+[ГЛОБАЛЬНОЕ ПОЗИЦИОНИРОВАНИЕ (GEX)]
+- GEX между Спотом и Путом (поддержка MM): {gex_low_defense:,.0f}
+- GEX между Спотом и Коллом (сопротивление MM): {gex_high_defense:,.0f}
+
+ТВОЯ ЗАДАЧА:
+1. Выгодна ли позиция относительно текущего Max Pain (притянет ли он цену в мой коридор или выбьет из него)?
+2. Проанализируй Дельту. Какой барьер сейчас математически в бОльшей опасности?
+3. Скажи, ожидаются ли макро-события (CPI, ФРС) до {selected_exp}, способные сломать барьеры, учитывая ожидаемое отклонение в ±${expected_move:,.0f}.
 """
-    st.code(report, language="markdown")
+    st.code(prompt, language="markdown")
