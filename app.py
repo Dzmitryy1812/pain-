@@ -43,15 +43,38 @@ def get_prob_inside(S, K_low, K_high, iv, T):
 # --- ЗАГРУЗКА ДАННЫХ BYBIT V5 ---
 @st.cache_data(ttl=30)
 def fetch_bybit_market_data():
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
     try:
-        # 1. Spot Price
-        r_price = requests.get("https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT", timeout=5).json()
-        spot = float(r_price["result"]["list"][0]["lastPrice"])
+        # 1. Запрос цены спота
+        spot_url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT"
+        r_price = requests.get(spot_url, headers=headers, timeout=10)
         
-        # 2. Options Data (Base BTC)
-        r_opt = requests.get("https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC", timeout=10).json()
+        if r_price.status_code != 200:
+            st.error(f"Ошибка Spot API: {r_price.status_code}")
+            return 0.0, pd.DataFrame()
+        
+        price_json = r_price.json()
+        spot = float(price_json["result"]["list"][0]["lastPrice"])
+        
+        # 2. Запрос опционов
+        opt_url = "https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC"
+        r_opt = requests.get(opt_url, headers=headers, timeout=15)
+        
+        if r_opt.status_code != 200:
+            st.error(f"Ошибка Options API: {r_opt.status_code}")
+            return spot, pd.DataFrame()
+            
+        opt_json = r_opt.json()
+        
+        if opt_json.get("retCode") != 0:
+            st.error(f"Bybit Error: {opt_json.get('retMsg')}")
+            return spot, pd.DataFrame()
+
         data = []
-        for item in r_opt["result"]["list"]:
+        for item in opt_json["result"]["list"]:
             symbol_parts = item['symbol'].split("-")
             if len(symbol_parts) < 4: continue
             data.append({
@@ -66,9 +89,15 @@ def fetch_bybit_market_data():
                 "oi": float(item.get("openInterest", 0)),
                 "vol": float(item.get("totalVolume", 0))
             })
-        return spot, pd.DataFrame(data)
+        
+        df = pd.DataFrame(data)
+        if df.empty:
+            st.warning("Bybit вернул пустой список опционов.")
+            
+        return spot, df
+
     except Exception as e:
-        st.error(f"Bybit API Error: {e}")
+        st.error(f"Критическая ошибка: {str(e)}")
         return 0.0, pd.DataFrame()
 
 # --- ПАРСЕР ДАТЫ ---
