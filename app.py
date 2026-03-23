@@ -44,35 +44,38 @@ def get_prob_inside(S, K_low, K_high, iv, T):
 @st.cache_data(ttl=30)
 def fetch_bybit_market_data():
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
     }
     
+    # ИСПОЛЬЗУЕМ ЗЕРКАЛО BYBIT (api.bytick.com отлично работает в обход WAF)
+    bybit_base = "https://api.bytick.com" 
+    
     try:
-        # 1. Запрос цены спота
-        spot_url = "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT"
-        r_price = requests.get(spot_url, headers=headers, timeout=10)
+        # --- 1. СПОТОВАЯ ЦЕНА (С резервированием через Binance) ---
+        r_price = requests.get(f"{bybit_base}/v5/market/tickers?category=spot&symbol=BTCUSDT", headers=headers, timeout=5)
         
-        if r_price.status_code != 200:
-            st.error(f"Ошибка Spot API: {r_price.status_code}")
-            return 0.0, pd.DataFrame()
+        if r_price.status_code == 200:
+            spot = float(r_price.json()["result"]["list"][0]["lastPrice"])
+        else:
+            # FALLBACK: Если Bybit все-таки блокирует спот, берем цену с Binance
+            r_binance = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
+            spot = float(r_binance.json()["price"])
+
+        # --- 2. ОПЦИОНЫ BYBIT ---
+        # Пробуем основное зеркало Bybit
+        r_opt = requests.get(f"{bybit_base}/v5/market/tickers?category=option&baseCoin=BTC", headers=headers, timeout=10)
         
-        price_json = r_price.json()
-        spot = float(price_json["result"]["list"][0]["lastPrice"])
-        
-        # 2. Запрос опционов
-        opt_url = "https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC"
-        r_opt = requests.get(opt_url, headers=headers, timeout=15)
-        
+        # Если первое зеркало выдает 403, пробуем голландский сервер Bybit
+        if r_opt.status_code == 403:
+            st.toast("Зеркало Bytick выдало 403, пробуем Bybit.nl...", icon="🔄")
+            r_opt = requests.get("https://api.bybit.nl/v5/market/tickers?category=option&baseCoin=BTC", headers=headers, timeout=10)
+
         if r_opt.status_code != 200:
-            st.error(f"Ошибка Options API: {r_opt.status_code}")
+            st.error(f"Критическая блокировка Bybit (Код {r_opt.status_code}). Сервер Streamlit заблокирован биржей.")
             return spot, pd.DataFrame()
             
         opt_json = r_opt.json()
         
-        if opt_json.get("retCode") != 0:
-            st.error(f"Bybit Error: {opt_json.get('retMsg')}")
-            return spot, pd.DataFrame()
-
         data = []
         for item in opt_json["result"]["list"]:
             symbol_parts = item['symbol'].split("-")
@@ -89,17 +92,12 @@ def fetch_bybit_market_data():
                 "oi": float(item.get("openInterest", 0)),
                 "vol": float(item.get("totalVolume", 0))
             })
-        
-        df = pd.DataFrame(data)
-        if df.empty:
-            st.warning("Bybit вернул пустой список опционов.")
             
-        return spot, df
+        return spot, pd.DataFrame(data)
 
     except Exception as e:
-        st.error(f"Критическая ошибка: {str(e)}")
+        st.error(f"Ошибка соединения: {str(e)}")
         return 0.0, pd.DataFrame()
-
 # --- ПАРСЕР ДАТЫ ---
 def parse_bybit_exp(exp_str):
     return datetime.strptime(exp_str, "%d%b%y").replace(tzinfo=timezone.utc) + timedelta(hours=8)
