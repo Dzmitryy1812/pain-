@@ -43,64 +43,88 @@ def get_prob_inside(S, K_low, K_high, iv, T):
 # --- ЗАГРУЗКА ДАННЫХ BYBIT V5 ---
 @st.cache_data(ttl=30)
 def fetch_bybit_market_data():
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    spot = 0.0
+    df = pd.DataFrame()
+
+    # --- 1. ДОБЫВАЕМ ЦЕНУ СПОТА (ПРОБИВАЕМ БЛОКИРОВКИ) ---
+    spot_sources = [
+        "https://api.bytick.com/v5/market/tickers?category=spot&symbol=BTCUSDT", # Зеркало Bybit
+        "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT",  # Основной Bybit
+        "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT",              # Binance USA (не блочит США)
+        "https://mempool.space/api/v1/prices"                                     # Mempool (вообще нет блокировок)
+    ]
     
-    # ИСПОЛЬЗУЕМ ЗЕРКАЛО BYBIT (api.bytick.com отлично работает в обход WAF)
-    bybit_base = "https://api.bytick.com" 
+    for url in spot_sources:
+        try:
+            r = requests.get(url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if "bytick" in url or "bybit" in url:
+                    spot = float(data.get("result", {}).get("list", [{}])[0].get("lastPrice", 0))
+                elif "binance" in url:
+                    spot = float(data.get("price", 0))
+                elif "mempool" in url:
+                    spot = float(data.get("USD", 0))
+                    
+                if spot > 0:
+                    break # Успешно нашли цену, выходим из цикла
+        except Exception:
+            continue
+            
+    if spot == 0.0:
+        st.error("❌ Не удалось получить цену BTC ни с одного источника.")
+        return 0.0, df
+
+    # --- 2. ДОБЫВАЕМ ОПЦИОНЫ BYBIT (ПЕРЕБОР ЗЕРКАЛ) ---
+    opt_sources = [
+        "https://api.bytick.com/v5/market/tickers?category=option&baseCoin=BTC",
+        "https://api.bybit.com/v5/market/tickers?category=option&baseCoin=BTC",
+        "https://api.bybit.nl/v5/market/tickers?category=option&baseCoin=BTC"
+    ]
     
-    try:
-        # --- 1. СПОТОВАЯ ЦЕНА (С резервированием через Binance) ---
-        r_price = requests.get(f"{bybit_base}/v5/market/tickers?category=spot&symbol=BTCUSDT", headers=headers, timeout=5)
-        
-        if r_price.status_code == 200:
-            spot = float(r_price.json()["result"]["list"][0]["lastPrice"])
-        else:
-            # FALLBACK: Если Bybit все-таки блокирует спот, берем цену с Binance
-            r_binance = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
-            spot = float(r_binance.json()["price"])
-
-        # --- 2. ОПЦИОНЫ BYBIT ---
-        # Пробуем основное зеркало Bybit
-        r_opt = requests.get(f"{bybit_base}/v5/market/tickers?category=option&baseCoin=BTC", headers=headers, timeout=10)
-        
-        # Если первое зеркало выдает 403, пробуем голландский сервер Bybit
-        if r_opt.status_code == 403:
-            st.toast("Зеркало Bytick выдало 403, пробуем Bybit.nl...", icon="🔄")
-            r_opt = requests.get("https://api.bybit.nl/v5/market/tickers?category=option&baseCoin=BTC", headers=headers, timeout=10)
-
-        if r_opt.status_code != 200:
-            st.error(f"Критическая блокировка Bybit (Код {r_opt.status_code}). Сервер Streamlit заблокирован биржей.")
-            return spot, pd.DataFrame()
+    opt_data = None
+    for url in opt_sources:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("retCode") == 0:
+                    opt_data = data["result"]["list"]
+                    break # Успешно скачали опционы
+        except Exception:
+            continue
             
-        opt_json = r_opt.json()
-        
-        data = []
-        for item in opt_json["result"]["list"]:
-            symbol_parts = item['symbol'].split("-")
-            if len(symbol_parts) < 4: continue
-            data.append({
-                "symbol": item['symbol'],
-                "exp": symbol_parts[1],
-                "strike": float(symbol_parts[2]),
-                "type": symbol_parts[3],
-                "iv": float(item.get("markIv", 0.5)),
-                "bid": float(item.get("bid1Price", 0)),
-                "ask": float(item.get("ask1Price", 0)),
-                "mark": float(item.get("markPrice", 0)),
-                "oi": float(item.get("openInterest", 0)),
-                "vol": float(item.get("totalVolume", 0))
-            })
-            
-        return spot, pd.DataFrame(data)
+    if not opt_data:
+        st.error("❌ Bybit блокирует доступ к опционам сервера Streamlit (403 Forbidden).")
+        st.info("💡 Решение: Запусти скрипт на своем ПК локально (`streamlit run app.py`), а не в облаке.")
+        return spot, df
 
-    except Exception as e:
-        st.error(f"Ошибка соединения: {str(e)}")
-        return 0.0, pd.DataFrame()
-# --- ПАРСЕР ДАТЫ ---
-def parse_bybit_exp(exp_str):
-    return datetime.strptime(exp_str, "%d%b%y").replace(tzinfo=timezone.utc) + timedelta(hours=8)
+    # --- 3. ПАРСИНГ ДАННЫХ ---
+    parsed_data = []
+    for item in opt_data:
+        parts = item.get('symbol', '').split("-")
+        if len(parts) < 4: continue
+        
+        parsed_data.append({
+            "symbol": item['symbol'],
+            "exp": parts[1],
+            "strike": float(parts[2]),
+            "type": parts[3],
+            "iv": float(item.get("markIv", 0) or 0),
+            "bid": float(item.get("bid1Price", 0) or 0),
+            "ask": float(item.get("ask1Price", 0) or 0),
+            "mark": float(item.get("markPrice", 0) or 0),
+            "oi": float(item.get("openInterest", 0) or 0),
+            "vol": float(item.get("totalVolume", 0) or 0)
+        })
+
+    df = pd.DataFrame(parsed_data)
+    
+    if df.empty:
+        st.warning("⚠️ Получен пустой список опционов от Bybit.")
+        
+    return spot, df
 
 # --- ОСНОВНОЙ ИНТЕРФЕЙС ---
 st.title("⚡ Bybit BTC Alpha Terminal")
