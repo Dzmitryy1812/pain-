@@ -483,32 +483,44 @@ st.divider()
 st.markdown("### 🤖 Генератор AI-Промпта")
 st.write("Сгенерировать готовый промпт с текущими переменными для ChatGPT или Claude.")
 
-def get_btc_range_10d():
-    """Сверхбыстрый парсер дневных свечей с Bybit без тяжелой панды"""
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "spot",
-        "symbol": "BTCUSDT",
-        "interval": "D",  # Дневные свечи
-        "limit": 10       # Ровно за 10 дней
-    }
+def get_btc_range_10d_bulletproof():
+    """Сверхнадежный парсер: не блокируется облачными IP. Пробует KuCoin, затем Kraken."""
+    
+    # 1-я попытка: KuCoin (BTC-USDT). Не имеет жесткого блока США для публичных API.
     try:
-        r = requests.get(url, params=params, timeout=3)
+        url_kucoin = "https://api.kucoin.com/api/v1/market/candles?symbol=BTC-USDT&type=1day"
+        r = requests.get(url_kucoin, timeout=4)
         if r.status_code == 200:
-            data = r.json().get("result", {}).get("list", [])
-            if data and len(data) > 0:
-                # Bybit отдает массив [startTime, open, high, low, close, ...]
-                highs = [float(candle[2]) for candle in data]
-                lows = [float(candle[3]) for candle in data]
-                
-                # Нулевой индекс [0] у Bybit - это текущий/последний день
-                last_price = float(data[0][4]) 
-                
+            res = r.json()
+            if res.get("code") == "200000" and res.get("data"):
+                # KuCoin отдает: [time, open, close, high, low, ...] (нулевой индекс - самый свежий день)
+                data = res["data"][:10] # берем 10 последних дней
+                highs = [float(c[3]) for c in data]
+                lows = [float(c[4]) for c in data]
+                last_price = float(data[0][2]) # close последнего дня
                 return min(lows), max(highs), last_price
-    except Exception as e:
-        print(f"Ошибка Bybit: {e}")
+    except Exception:
         pass
-        
+
+    # 2-я попытка: Kraken (BTC-USD). Один из самых стабильных API в мире.
+    try:
+        url_kraken = "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440"
+        r = requests.get(url_kraken, timeout=4)
+        if r.status_code == 200:
+            res = r.json()
+            if not res.get("error"):
+                # Kraken отдает ключи, ищем пару XXBTZUSD
+                data = res.get("result", {}).get("XXBTZUSD", [])
+                if data:
+                    data = data[-10:] # берем с конца
+                    # Kraken отдает: [time, open, high, low, close, ...]
+                    highs = [float(c[2]) for c in data]
+                    lows = [float(c[3]) for c in data]
+                    last_price = float(data[-1][4]) # close последней свечи
+                    return min(lows), max(highs), last_price
+    except Exception:
+        pass
+
     return None, None, None
 
 def get_calendar_path(target_exp: str):
@@ -527,14 +539,14 @@ def get_calendar_path(target_exp: str):
         return "Не удалось рассчитать календарь"
 
 if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
-    with st.spinner("Загрузка 10-дневной истории Bybit и расчет метрик..."):
+    with st.spinner("Загрузка 10-дневной истории (KuCoin/Kraken) и расчет метрик..."):
         
-        # 1. Загружаем историю 10 дней (дневные свечи)
-        b_min, b_max, b_spot = get_btc_range_10d()
+        # 1. Загружаем историю 10 дней
+        b_min, b_max, b_spot = get_btc_range_10d_bulletproof()
         
-        # Защита: если Bybit все-таки не ответил
+        # Защита: если обе биржи недоступны
         if b_min is None or b_max is None:
-            st.error("⚠️ Bybit отклонил запрос. Используются заглушки.")
+            st.error("⚠️ Биржи отклонили запрос. Используются заглушки.")
             final_spot = spot_price
             c_min, c_max = spot_price, spot_price
         else:
@@ -575,7 +587,7 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 1. Текущий Spot BTC: ${final_spot:,.0f}
 2. Текущий DVOL (Ожидаемая волатильность): {current_dvol:.1f}%
 
-[РЕАЛЬНЫЙ ДИАПАЗОН BTC ЗА 10 ДНЕЙ (BYBIT)]
+[РЕАЛЬНЫЙ ДИАПАЗОН BTC ЗА 10 ДНЕЙ]
 - Минимум: ${c_min:,.0f}
 - Максимум: ${c_max:,.0f}
 
@@ -618,5 +630,5 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 9. **Риск-менеджмент**: Оцени адекватность стоп-лосса -10% от стоимости всей конструкции.
 """
 
-        st.success("✅ Промпт готов (исторические данные загружены с API Bybit 1D)")
+        st.success("✅ Промпт готов (данные успешно загружены через KuCoin/Kraken API)")
         st.code(prompt_text, language="markdown")
