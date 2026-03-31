@@ -483,36 +483,37 @@ st.divider()
 st.markdown("### 🤖 Генератор AI-Промпта")
 st.write("Сгенерировать готовый промпт с текущими переменными для ChatGPT или Claude.")
 
-# --- ОПТИМИЗИРОВАННАЯ ФУНКЦИЯ ДИАПАЗОНА ---
-def get_btc_range_10d_safe():
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": "BTCUSDT", "interval": "1h", "limit": 240}
+# --- ФУНКЦИЯ ДИАПАЗОНА СТРОГО ЧЕРЕЗ BYBIT ---
+def get_btc_range_10d_bybit():
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "spot",
+        "symbol": "BTCUSDT",
+        "interval": "60", # 60 минут = 1 час
+        "limit": 240      # 240 часов = 10 дней
+    }
     try:
-        response = requests.get(url, params=params, timeout=5)
-        if response.status_code != 200:
-            return None, None, None
-        data = response.json()
-        if not data or not isinstance(data, list) or len(data) == 0:
-            return None, None, None
-        
-        df_range = pd.DataFrame(data, columns=[
-            "time","open","high","low","close","volume",
-            "close_time","qav","trades","tbbav","tbqav","ignore"
-        ])
-        
-        # Преобразование типов
-        for col in ["high", "low", "close"]:
-            df_range[col] = pd.to_numeric(df_range[col], errors='coerce')
-            
-        min_p = df_range["low"].min()
-        max_p = df_range["high"].max()
-        last_p = df_range["close"].iloc[-1]
-        
-        return min_p, max_p, last_p
-    except Exception:
+        r = requests.get(url, params=params, timeout=5)
+        if r.status_code == 200:
+            data = r.json().get("result", {}).get("list", [])
+            if data and len(data) > 0:
+                # Bybit отдает: [startTime, open, high, low, close, volume, turnover]
+                # Свечи идут в обратном порядке (нулевой индекс = самая свежая)
+                df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "vol", "turnover"])
+                
+                df["high"] = df["high"].astype(float)
+                df["low"] = df["low"].astype(float)
+                df["close"] = df["close"].astype(float)
+                
+                min_p = df["low"].min()
+                max_p = df["high"].max()
+                last_p = df["close"].iloc[0] # Текущая цена
+                
+                return min_p, max_p, last_p
+        return None, None, None
+    except Exception as e:
         return None, None, None
 
-# Функция для календаря
 def get_calendar_path(target_exp: str):
     try:
         now = datetime.now(timezone.utc)
@@ -528,16 +529,23 @@ def get_calendar_path(target_exp: str):
     except:
         return "Не удалось рассчитать календарь"
 
-# Основная логика генерации при нажатии кнопки
+# Основная логика по кнопке
 if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
-    with st.spinner("Сбор данных и расчет метрик..."):
-        # 1. Получаем исторический диапазон
-        b_min, b_max, b_spot = get_btc_range_10d_safe()
+    with st.spinner("Сбор исторических данных c Bybit и расчет метрик..."):
         
-        # Если Binance подвел, используем текущий спот из начала кода
-        final_spot = b_spot if b_spot else spot_price
+        # 1. Загружаем историю 10 дней
+        btc_min_10d, btc_max_10d, current_spot = get_btc_range_10d_bybit()
         
-        # 2. Собираем данные по опционам (цепочка рядом с экспирацией)
+        # Защита от потенциальной ошибки (если нет связи, берем спот из начала кода)
+        final_spot = current_spot if current_spot else spot_price
+        c_min = btc_min_10d if btc_min_10d else final_spot
+        c_max = btc_max_10d if btc_max_10d else final_spot
+
+        # 2. Высчитываем Edge (дистанции)
+        low_dist_pct = ((final_spot - c_min) / final_spot * 100) if final_spot > 0 else 0
+        high_dist_pct = ((c_max - final_spot) / final_spot * 100) if final_spot > 0 else 0
+
+        # 3. Собираем мультидень-текст по опционам (цепочка вокруг экспирации)
         try:
             idx = expiries_list.index(selected_exp)
             start_idx = max(0, idx - 2)
@@ -545,7 +553,7 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
         except:
             target_exps = [selected_exp]
 
-        m_text = ""
+        multi_day_text = ""
         for e in target_exps:
             df_e = df_options[df_options['exp'] == e].copy()
             if df_e.empty: continue
@@ -554,44 +562,61 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
             df_e["g"] = df_e.apply(lambda rr: calc_gamma(final_spot, rr["strike"], iv_used, T_e, r=r), axis=1)
             df_e["gx"] = df_e.apply(lambda rr: rr["oi"] * rr["g"] * final_spot**2 * 0.01 * (1 if rr["type"] == "C" else -1), axis=1)
             total_gx = df_e["gx"].sum()
-            gx_desc = "Positive (Stability)" if total_gx > 0 else "Negative (Volatility Risk)"
-            m_text += f"- {e}: Max Pain ${mp:,.0f}, GEX: {gx_desc} ({total_gx:,.0f})\n"
+            gex_type = "Положительный (держит флэт)" if total_gx > 0 else "Отрицательный (риск пробоя)"
+            multi_day_text += f"- {e}: Max Pain ${mp:,.0f}, GEX: {gex_type} ({total_gx:,.0f})\n"
 
-        # 3. Расчет дистанций
-        l_dist = ((final_spot - b_min) / final_spot * 100) if b_min and final_spot else 0
-        h_dist = ((b_max - final_spot) / final_spot * 100) if b_max and final_spot else 0
-        
-        cal_path = get_calendar_path(selected_exp)
+        calendar_path = get_calendar_path(selected_exp)
 
-        # 4. Формируем финальный текст
-        prompt_content = f"""Ты — квант-аналитик крипто-опционов. Твоя задача: оценить риск стратегии "Короткий стрэнгл" на Polymarket.
+        # 4. Формируем итоговый промпт со всеми 9 пунктами
+        prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
+Моя стратегия: Синтетический короткий стрэнгл на Polymarket состоящий из двух ног конструкции. Ставка на удержание цены в диапазоне (низкую волатильность и тета - на это идет расчет).
 
-[РЫНОЧНЫЙ КОНТЕКСТ]
-- Текущий спот BTC: ${final_spot:,.0f}
-- Волатильность (DVOL): {current_dvol:.1f}%
-- Реал. диапазон (10дн): ${b_min or 0:,.0f} — ${b_max or 0:,.0f}
-- Дистанция до границ диапазона: Low {l_dist:.1f}%, High {h_dist:.1f}%
+[ИНСТРУКЦИЯ ПО РЫНКУ]
+1. Текущий Spot BTC: ${final_spot:,.0f}
+2. Текущий DVOL (Ожидаемая волатильность): {current_dvol:.1f}%
 
-[МОЯ СДЕЛКА (Polymarket)]
-- Экспирация: {selected_exp}
-- Нижний барьер: {p_low_strike:,.0f} (Твоя цена YES: ${p_low_price:.2f}, Модель BSM: {prob_above_low*100:.1f}%)
-- Верхний барьер: {p_high_strike:,.0f} (Твоя цена NO: ${p_high_price:.2f}, Модель BSM: {prob_below_high*100:.1f}%)
-- BSM вероятность успеха (внутри): {prob_inside*100:.1f}%
-- Общая стоимость позиции: ${p_low_price + p_high_price:.2f}
+[РЕАЛЬНЫЙ ДИАПАЗОН BTC ЗА 10 ДНЕЙ (BYBIT)]
+- Минимум: ${c_min:,.0f}
+- Максимум: ${c_max:,.0f}
 
-[ДАННЫЕ DERIBIT]
-{m_text}
+[ПОЗИЦИЯ В ДИАПАЗОНЕ]
+- Дистанция до минимума: {low_dist_pct:.2f}%
+- Дистанция до максимума: {high_dist_pct:.2f}%
 
-[КАЛЕНДАРЬ]
-{cal_path}
+ЗАДАЧА №0: Используй предоставленный диапазон (${c_min:,.0f} – ${c_max:,.0f}) как фактический. НЕ придумывай данные от себя.
+
+[МОЯ СДЕЛКА НА POLYMARKET] (Дата экспирации: {selected_exp})
+- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Моя цена захода (YES): ${p_low_price:.2f}. BSM вероятность удержать: {prob_above_low*100:.1f}%
+- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Моя цена захода (NO): ${p_high_price:.2f}. BSM вероятность удержать: {prob_below_high*100:.1f}%
+- Общая BSM вероятность удержания ВНУТРИ коридора: {prob_inside*100:.1f}%
+
+[ДАННЫЕ ПО ОПЦИОНАМ DERIBIT]
+{multi_day_text}
+[КАЛЕНДАРНЫЙ КОНТЕКСТ]
+{calendar_path}
 
 [ТВОЯ ЗАДАЧА]
-Дай краткий анализ:
-1. Оценка сделки от 1 до 10.
-2. Анализ барьеров: защищены ли они историческими Low/High за 10 дней?
-3. Влияние Max Pain: тянет ли рынок к пробою моих границ?
-4. Риск событий в календаре.
-5. Вердикт: ОДОБРЕНО или ПРОПУСК.
+Выдай ответ строго в Markdown:
+
+1. **Вердикт ИИ**: ОДОБРЕНО / ПРОПУСК / ОПАСНО (и оценка 1-10). Кратко логику.
+
+2. **Анализ экстремумов**:
+Учитывая диапазон за 10 дней, находятся ли мои барьеры ${p_low_strike:,.0f} и ${p_high_strike:,.0f} ВНУТРИ этого диапазона или они защищены историческими экстремумами (ЗА пределами)? 
+
+3. **Цели (Max Pain)**: Как движется Max Pain к {selected_exp}? Есть ли риск, что цена будет притянута к нему и пробьет барьер?
+
+4. **Макро-риск**: Есть ли в календаре события на этих датах, способные вызвать скачок волатильности?
+
+5. **Финансовый Edge**: Оправдывает ли стоимость входа (${p_low_price + p_high_price:.2f}) математическую вероятность успеха?
+
+6. **Наихудший сценарий**: С какой стороны (сверху или снизу) риск провала выше?
+
+7. **Тайминг**: Конструкция закрывается за 24 часа до экспирации. Снижает ли это риск гамма-сквиза?
+
+8. **Точка входа**: Открывать сейчас или ждать (например, изменения GEX или снижения DVOL)?
+
+9. стоп-лосс -10% от стоимости всей конструкции.
 """
-        st.success("✅ Промпт успешно сгенерирован!")
-        st.code(prompt_content, language="markdown")
+
+        st.success("✅ Промпт готов (исторические данные загружены с API Bybit)")
+        st.code(prompt_text, language="markdown")
