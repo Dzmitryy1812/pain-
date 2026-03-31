@@ -212,7 +212,7 @@ with st.sidebar:
     # Ссылка на Polymarket теперь тоже в сайдбаре!
     poly_url = st.text_input(
         "Ссылка на событие (Polymarket):", 
-        value="https://polymarket.com/event/bitcoin-above-on-march-24",
+        value="https://polymarket.com/event/bitcoin-above-on-april-1",
         help="Вставь ссылку на страницу события, чтобы кнопки 🔄 могли подтянуть цены"
     )
     
@@ -483,97 +483,168 @@ st.divider()
 st.markdown("### 🤖 Генератор AI-Промпта")
 st.write("Сгенерировать готовый промпт с текущими переменными для ChatGPT или Claude.")
 
-# Функция получения экстремумов за 7 дней
-@st.cache_data(ttl=3600)
-def get_weekly_extremes():
-    try:
-        # Увеличиваем таймаут и проверяем статус ответа
-        response = requests.get(
-            "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=7", 
-            timeout=5
-        )
-        if response.status_code != 200:
-            return None, None
-        
-        r = response.json()
-        lows = [float(candle[3]) for candle in r]
-        highs = [float(candle[2]) for candle in r]
-        return min(lows), max(highs)
-    except Exception as e:
-        print(f"Ошибка запроса к Binance: {e}")
-        return None, None
+# --- НОВАЯ ФУНКЦИЯ: РАСЧЕТ РЕАЛИЗОВАННОЙ ВОЛАТИЛЬНОСТИ (RV) ---
+def calculate_rv(closes):
+    if not closes or len(closes) < 2: 
+        return 0.0
+    # 1. Логарифмическая доходность: ln(P_t / P_{t-1})
+    log_returns = np.log(np.array(closes[1:]) / np.array(closes[:-1]))
+    
+    # 2. Дневное стандартное отклонение (ddof=1 для точности на малых выборках вроде 10 дней)
+    daily_vol = np.std(log_returns, ddof=1)
+    
+    # 3. Годовая реализованная волатильность (крипта = 365 дней)
+    annualized_rv = daily_vol * np.sqrt(365) * 100 
+    
+    return annualized_rv
 
-# Функция для определения дней недели на пути к экспирации
+def get_btc_range_10d_bulletproof():
+    """Сверхнадежный парсер. Теперь возвращает также массив цен закрытия (closes)"""
+    # 1. KuCoin
+    try:
+        url_kucoin = "https://api.kucoin.com/api/v1/market/candles?symbol=BTC-USDT&type=1day"
+        r = requests.get(url_kucoin, timeout=4)
+        if r.status_code == 200:
+            res = r.json()
+            if res.get("code") == "200000" and res.get("data"):
+                data = res["data"][:10] 
+                highs = [float(c[3]) for c in data]
+                lows = [float(c[4]) for c in data]
+                closes = [float(c[2]) for c in data]
+                # KuCoin отдает от новых к старым. Переворачиваем для хронологии:
+                closes.reverse()
+                return min(lows), max(highs), float(data[0][2]), closes
+    except Exception:
+        pass
+
+    # 2. Kraken
+    try:
+        url_kraken = "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440"
+        r = requests.get(url_kraken, timeout=4)
+        if r.status_code == 200:
+            res = r.json()
+            if not res.get("error"):
+                data = res.get("result", {}).get("XXBTZUSD", [])
+                if data:
+                    data = data[-10:]
+                    highs = [float(c[2]) for c in data]
+                    lows = [float(c[3]) for c in data]
+                    closes = [float(c[4]) for c in data] # Kraken отдает хронологично
+                    return min(lows), max(highs), float(data[-1][4]), closes
+    except Exception:
+        pass
+
+    return None, None, None, []
+
 def get_calendar_path(target_exp: str):
-    now = datetime.now(timezone.utc)
-    exp_dt = parse_expiry(target_exp)
-    days_info = []
-    
-    current = now
-    while current.date() <= exp_dt.date():
-        day_name = current.strftime("%A")  # Monday, Tuesday, etc.
-        is_weekend = day_name in ["Saturday", "Sunday"]
-        emoji = "🏖️" if is_weekend else "📊"
-        days_info.append(f"{emoji} {current.strftime('%d %b')} ({day_name})")
-        current += timedelta(days=1)
-    
-    return "\n".join(days_info)
+    try:
+        now = datetime.now(timezone.utc)
+        exp_dt = parse_expiry(target_exp)
+        days_info = []
+        current = now
+        while current.date() <= exp_dt.date():
+            day_name = current.strftime("%A")
+            emoji = "🏖️" if day_name in ["Saturday", "Sunday"] else "📊"
+            days_info.append(f"{emoji} {current.strftime('%d %b')} ({day_name})")
+            current += timedelta(days=1)
+        return "\n".join(days_info)
+    except:
+        return "Не удалось рассчитать календарь"
 
 if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
-    # Теперь мы НЕ запрашиваем экстремумы у Binance, а просим ИИ сделать это
-    
-    # Расчеты для промпта (остаются как были)
-    try:
-        idx = expiries_list.index(selected_exp)
-        start_idx = max(0, idx - 3)
-        target_exps = expiries_list[start_idx:idx+1]
-    except ValueError:
-        target_exps = [selected_exp]
+    with st.spinner("Загрузка истории, расчет RV и метрик..."):
+        
+        # 1. Загружаем историю 10 дней + массив closes
+        b_min, b_max, b_spot, b_closes = get_btc_range_10d_bulletproof()
+        
+        # Защита графиков
+        if b_min is None or b_max is None:
+            st.error("⚠️ Биржи отклонили запрос. Используются заглушки.")
+            final_spot = spot_price
+            c_min, c_max = spot_price, spot_price
+            rv_10d = current_dvol # Если нет данных, приравниваем RV к IV
+        else:
+            final_spot = b_spot
+            c_min, c_max = b_min, b_max
+            rv_10d = calculate_rv(b_closes) # <--- ВОТ РАСЧЕТ РЕАЛИЗОВАННОЙ ВОЛАТИЛЬНОСТИ
 
-    multi_day_text = ""
-    for e in target_exps:
-        df_e = df_options[df_options['exp'] == e].copy()
-        if df_e.empty: continue
-        _, _, mp = calc_max_pain(df_e)
-        T_e = max((parse_expiry(e) - datetime.now(timezone.utc)).total_seconds(), 300) / (365 * 24 * 3600)
-        df_e["g"] = df_e.apply(lambda rr: calc_gamma(spot_price, rr["strike"], iv_used, T_e, r=r), axis=1)
-        df_e["gx"] = df_e.apply(lambda rr: rr["oi"] * rr["g"] * spot_price**2 * 0.01 * (1 if rr["type"] == "C" else -1), axis=1)
-        total_gx = df_e["gx"].sum()
-        gex_type = "Положительный (держит флэт)" if total_gx > 0 else "Отрицательный (риск пробоя)"
-        multi_day_text += f"- {e}: Max Pain ${mp:,.0f}, GEX: {gex_type} ({total_gx:,.0f})\n"
+        # Расчет Премии за риск (Volatility Risk Premium)
+        vrp = current_dvol - rv_10d
 
-    calendar_path = get_calendar_path(selected_exp)
+        # 2. Высчитываем Edge (дистанции)
+        low_dist_pct = ((final_spot - c_min) / final_spot * 100) if final_spot > 0 else 0
+        high_dist_pct = ((c_max - final_spot) / final_spot * 100) if final_spot > 0 else 0
 
-    # ОБНОВЛЕННЫЙ ТЕКСТ ПРОМПТА (инструкция для ИИ внутри)
-    prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
-Моя стратегия: Синтетический короткий стрэнгл на Polymarket. Ставка на удержание цены в диапазоне.
+        # 3. Собираем мультидень-текст по опционам
+        try:
+            idx = expiries_list.index(selected_exp)
+            start_idx = max(0, idx - 2)
+            target_exps = expiries_list[start_idx:idx+1]
+        except:
+            target_exps = [selected_exp]
+
+        multi_day_text = ""
+        for e in target_exps:
+            df_e = df_options[df_options['exp'] == e].copy()
+            if df_e.empty: continue
+            _, _, mp = calc_max_pain(df_e)
+            T_e = max((parse_expiry(e) - datetime.now(timezone.utc)).total_seconds(), 300) / (365 * 24 * 3600)
+            df_e["g"] = df_e.apply(lambda rr: calc_gamma(final_spot, rr["strike"], iv_used, T_e, r=r), axis=1)
+            df_e["gx"] = df_e.apply(lambda rr: rr["oi"] * rr["g"] * final_spot**2 * 0.01 * (1 if rr["type"] == "C" else -1), axis=1)
+            total_gx = df_e["gx"].sum()
+            gex_type = "Положительный (держит флэт)" if total_gx > 0 else "Отрицательный (риск пробоя)"
+            multi_day_text += f"- {e}: Max Pain ${mp:,.0f}, GEX: {gex_type} ({total_gx:,.0f})\n"
+
+        calendar_path = get_calendar_path(selected_exp)
+
+        # 4. Формируем итоговый промпт
+        prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
+Моя стратегия: Синтетический короткий стрэнгл на Polymarket (Ставка на удержание цены в диапазоне, расчет на низкую RV и сбор теты).
 
 [ИНСТРУКЦИЯ ПО РЫНКУ]
-1. Текущий Spot BTC: ${spot_price:,.0f}
-2. Текущий DVOL (Ожидаемая волатильность): {current_dvol:.1f}%
+1. Текущий Spot BTC: ${final_spot:,.0f}
 
-ТЕБЕ ЗАДАЧА №0: Самостоятельно проверь/используй данные о цене BTC за последние 7 дней. Найди экстремумы (High/Low) этой недели, чтобы оценить вероятность пробоя моих барьеров.
+[РЕАЛЬНЫЙ ДИАПАЗОН BTC ЗА 10 ДНЕЙ]
+- Минимум: ${c_min:,.0f} (Дистанция: {low_dist_pct:.2f}%)
+- Максимум: ${c_max:,.0f} (Дистанция: {high_dist_pct:.2f}%)
+ЗАДАЧА №0: Используй предоставленный диапазон (${c_min:,.0f} – ${c_max:,.0f}) как фактический. НЕ придумывай данные от себя.
+
+[ОЦЕНКА ВОЛАТИЛЬНОСТИ И ПРЕМИЯ ЗА РИСК (VRP)]
+- Ожидаемая волатильность рынка (IV / DVOL): {current_dvol:.1f}%
+- Фактическая (Реализованная) волатильность за 10 дней (RV): {rv_10d:.1f}%
+- Премия за риск (VRP = IV - RV): {vrp:+.1f}%
 
 [МОЯ СДЕЛКА НА POLYMARKET] (Дата экспирации: {selected_exp})
-- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Моя цена захода (YES): ${p_low_price:.2f}. BSM вероятность: {prob_above_low*100:.1f}%
-- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Моя цена захода (NO): ${p_high_price:.2f}. BSM вероятность: {prob_below_high*100:.1f}%
-- BSM вероятность удержания ВНУТРИ коридора: {prob_inside*100:.1f}%
+- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Моя цена захода (YES): ${p_low_price:.2f}. Себестоимость (BSM): {prob_above_low*100:.1f}%
+- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Моя цена захода (NO): ${p_high_price:.2f}. Себестоимость (BSM): {prob_below_high*100:.1f}%
+- Общая математическая (BSM) вероятность удержания ВНУТРИ коридора: {prob_inside*100:.1f}%
 
 [ДАННЫЕ ПО ОПЦИОНАМ DERIBIT]
 {multi_day_text}
-
 [КАЛЕНДАРНЫЙ КОНТЕКСТ]
 {calendar_path}
 
 [ТВОЯ ЗАДАЧА]
 Выдай ответ строго в Markdown:
-1. 🎯 Вердикт ИИ: ОДОБРЕНО / ПРОПУСК / ОПАСНО (и оценка 1-10). Кратко логику.
-2. 🛡️ Анализ экстремумов: Исходя из цен BTC за последние 7 дней (которые ты нашел), находятся ли мои барьеры ${p_low_strike:,.0f} и ${p_high_strike:,.0f} ПРЕДЕЛАМИ или ВНУТРИ недавнего торгового диапазона?
-3. 🧲 Цели (Max Pain): Как движется Max Pain к {selected_exp}? Вытянет ли он цену за мой барьер?
-4. 📅 Макро-риск: Проверь экономический календарь на период до {selected_exp}. Есть ли риск сильной волатильности (CPI, FOMC, NFP)?
-5. ⚖️ Финансовый Edge: Оправдывает ли стоимость входа (Polymarket) риски (BSM)?
-6. ⚠️ Угроза: Где наибольший риск провала сделки?
+
+1. **Вердикт ИИ**: ОДОБРЕНО / ПРОПУСК / ОПАСНО (и оценка 1-10). Кратко логику.
+
+2. **Анализ экстремумов**:
+Учитывая исторический 10d диапазон, находятся ли мои барьеры ${p_low_strike:,.0f} и ${p_high_strike:,.0f} ВНУТРИ этого диапазона или они защищены им (ЗА пределами)?
+
+3. **Анализ RV vs IV (VRP)**: 
+Сравни RV ({rv_10d:.1f}%) и IV ({current_dvol:.1f}%). Рынок переоценивает риски или Биткоин реально летает слишком сильно (RV > IV)? Оправдывает ли VRP ({vrp:+.1f}%) продажу волатильности?
+
+4. **Цели (Max Pain)**: Как движется Max Pain к {selected_exp}? Есть ли риск, что он притянет цену и пробьет барьер?
+
+5. **Макро-риск**: Есть ли в календаре события на этих датах, способные вызвать скачок RV?
+
+6. **Финансовый Edge**: Оправдывает ли общая стоимость входа (${p_low_price + p_high_price:.2f}) математическую вероятность успеха?
+
+7. **Наихудший сценарий**: С какой стороны (сверху или снизу) риск пробоя выше с учетом GEX и Дистанций до экстремумов?
+
+8. **Риск-менеджмент**: Оцени адекватность стоп-лосса -10% от стоимости всей конструкции.
 """
 
-    st.success("✅ Промпт готов! Теперь ИИ сам найдет волатильность за неделю.")
-    st.code(prompt_text, language="markdown")
+        st.success("✅ Промпт готов (RV, IV и Премия за риск добавлены)")
+        st.code(prompt_text, language="markdown")
