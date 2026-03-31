@@ -487,12 +487,16 @@ st.write("Сгенерировать готовый промпт с текущи
 def calculate_rv(closes):
     if not closes or len(closes) < 2: 
         return 0.0
-    # Считаем логарифмическую доходность
+    # 1. Логарифмическая доходность: ln(P_t / P_{t-1})
     log_returns = np.log(np.array(closes[1:]) / np.array(closes[:-1]))
-    # Считаем дневное стандартное отклонение
-    daily_vol = np.std(log_returns)
-    # Годовая реализованная волатильность (корень из 365)
-    return daily_vol * np.sqrt(365) * 100 
+    
+    # 2. Дневное стандартное отклонение (ddof=1 для точности на малых выборках вроде 10 дней)
+    daily_vol = np.std(log_returns, ddof=1)
+    
+    # 3. Годовая реализованная волатильность (крипта = 365 дней)
+    annualized_rv = daily_vol * np.sqrt(365) * 100 
+    
+    return annualized_rv
 
 def get_btc_range_10d_bulletproof():
     """Сверхнадежный парсер. Теперь возвращает также массив цен закрытия (closes)"""
