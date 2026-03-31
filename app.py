@@ -16,6 +16,33 @@ if "p_high_price" not in st.session_state:
 st.set_page_config(page_title="BTC Alpha Terminal", page_icon="⚡", layout="wide")
 
 # --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_bbw_data(symbol="BTCUSDT", interval="1d", length=20, mult=2.0, hl_ref=125):
+    # Загружаем историю (например, через KuCoin или Kraken)
+    # Для расчета hl_ref нам нужно минимум length + hl_ref свечей
+    url = f"https://api.kucoin.com/api/v1/market/candles?symbol={symbol.replace('USDT', '-USDT')}&type={interval}"
+    try:
+        r = requests.get(url, timeout=5).json()
+        data = r["data"] # [time, open, close, high, low, volume, amount]
+        df_hist = pd.DataFrame(data, columns=['t','o','c','h','l','v','a']).astype(float)
+        df_hist = df_hist.iloc[::-1].reset_index(drop=True) # Хронологический порядок
+        
+        # Расчет BBW
+        sma = df_hist['c'].rolling(window=length).mean()
+        std = df_hist['c'].rolling(window=length).std()
+        
+        upper = sma + (std * mult)
+        lower = sma - (std * mult)
+        
+        df_hist['bbw'] = (upper - lower) / sma
+        
+        # Референсные значения (High/Low за период)
+        df_hist['hx'] = df_hist['bbw'].rolling(window=hl_ref).max()
+        df_hist['lx'] = df_hist['bbw'].rolling(window=hl_ref).min()
+        
+        return df_hist.iloc[-1]['bbw'], df_hist.iloc[-1]['hx'], df_hist.iloc[-1]['lx']
+    except:
+        return 0.0, 0.0, 0.0
+
 def parse_expiry(exp_str: str) -> datetime:
     for fmt in ("%d%b%y", "%d%b%Y"):
         try:
@@ -330,6 +357,22 @@ c1, c2, c3 = st.columns(3)
 c1.metric("P(выше low)",  f"{prob_above_low*100:.1f}%")
 c2.metric("P(ниже high)", f"{prob_below_high*100:.1f}%")
 c3.metric("P(в диапазоне)", f"{prob_inside*100:.1f}%")
+st.subheader("📊 Индикаторы волатильности (BBW)")
+curr_bbw, bbw_high, bbw_low = get_bbw_data(hl_ref=125)
+
+col_bbw1, col_bbw2, col_bbw3 = st.columns(3)
+with col_bbw1:
+    st.metric("Текущий BBW", f"{curr_bbw:.4f}")
+with col_bbw2:
+    # Насколько текущая ширина близка к историческому максимуму
+    percent_of_max = (curr_bbw / bbw_high) * 100 if bbw_high != 0 else 0
+    st.metric("H-Ref (125d)", f"{bbw_high:.4f}", f"{percent_of_max:.1f}% от пика", delta_color="off")
+with col_bbw3:
+    st.metric("L-Ref (125d)", f"{bbw_low:.4f}")
+
+if curr_bbw <= bbw_low * 1.1:
+    st.warning("⚠️ **Squeeze Alert:** Полосы Боллинджера максимально сжаты. Ожидается сильный импульс!")
+
 # Расчёты
 st_pain, val_pain, max_pain = calc_max_pain(df)
 
