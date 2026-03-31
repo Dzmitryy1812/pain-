@@ -483,45 +483,54 @@ st.divider()
 st.markdown("### 🤖 Генератор AI-Промпта")
 st.write("Сгенерировать готовый промпт с текущими переменными для ChatGPT или Claude.")
 
+# --- НОВАЯ ФУНКЦИЯ: РАСЧЕТ РЕАЛИЗОВАННОЙ ВОЛАТИЛЬНОСТИ (RV) ---
+def calculate_rv(closes):
+    if not closes or len(closes) < 2: 
+        return 0.0
+    # Считаем логарифмическую доходность
+    log_returns = np.log(np.array(closes[1:]) / np.array(closes[:-1]))
+    # Считаем дневное стандартное отклонение
+    daily_vol = np.std(log_returns)
+    # Годовая реализованная волатильность (корень из 365)
+    return daily_vol * np.sqrt(365) * 100 
+
 def get_btc_range_10d_bulletproof():
-    """Сверхнадежный парсер: не блокируется облачными IP. Пробует KuCoin, затем Kraken."""
-    
-    # 1-я попытка: KuCoin (BTC-USDT). Не имеет жесткого блока США для публичных API.
+    """Сверхнадежный парсер. Теперь возвращает также массив цен закрытия (closes)"""
+    # 1. KuCoin
     try:
         url_kucoin = "https://api.kucoin.com/api/v1/market/candles?symbol=BTC-USDT&type=1day"
         r = requests.get(url_kucoin, timeout=4)
         if r.status_code == 200:
             res = r.json()
             if res.get("code") == "200000" and res.get("data"):
-                # KuCoin отдает: [time, open, close, high, low, ...] (нулевой индекс - самый свежий день)
-                data = res["data"][:10] # берем 10 последних дней
+                data = res["data"][:10] 
                 highs = [float(c[3]) for c in data]
                 lows = [float(c[4]) for c in data]
-                last_price = float(data[0][2]) # close последнего дня
-                return min(lows), max(highs), last_price
+                closes = [float(c[2]) for c in data]
+                # KuCoin отдает от новых к старым. Переворачиваем для хронологии:
+                closes.reverse()
+                return min(lows), max(highs), float(data[0][2]), closes
     except Exception:
         pass
 
-    # 2-я попытка: Kraken (BTC-USD). Один из самых стабильных API в мире.
+    # 2. Kraken
     try:
         url_kraken = "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440"
         r = requests.get(url_kraken, timeout=4)
         if r.status_code == 200:
             res = r.json()
             if not res.get("error"):
-                # Kraken отдает ключи, ищем пару XXBTZUSD
                 data = res.get("result", {}).get("XXBTZUSD", [])
                 if data:
-                    data = data[-10:] # берем с конца
-                    # Kraken отдает: [time, open, high, low, close, ...]
+                    data = data[-10:]
                     highs = [float(c[2]) for c in data]
                     lows = [float(c[3]) for c in data]
-                    last_price = float(data[-1][4]) # close последней свечи
-                    return min(lows), max(highs), last_price
+                    closes = [float(c[4]) for c in data] # Kraken отдает хронологично
+                    return min(lows), max(highs), float(data[-1][4]), closes
     except Exception:
         pass
 
-    return None, None, None
+    return None, None, None, []
 
 def get_calendar_path(target_exp: str):
     try:
@@ -539,25 +548,30 @@ def get_calendar_path(target_exp: str):
         return "Не удалось рассчитать календарь"
 
 if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
-    with st.spinner("Загрузка 10-дневной истории (KuCoin/Kraken) и расчет метрик..."):
+    with st.spinner("Загрузка истории, расчет RV и метрик..."):
         
-        # 1. Загружаем историю 10 дней
-        b_min, b_max, b_spot = get_btc_range_10d_bulletproof()
+        # 1. Загружаем историю 10 дней + массив closes
+        b_min, b_max, b_spot, b_closes = get_btc_range_10d_bulletproof()
         
-        # Защита: если обе биржи недоступны
+        # Защита графиков
         if b_min is None or b_max is None:
             st.error("⚠️ Биржи отклонили запрос. Используются заглушки.")
             final_spot = spot_price
             c_min, c_max = spot_price, spot_price
+            rv_10d = current_dvol # Если нет данных, приравниваем RV к IV
         else:
             final_spot = b_spot
             c_min, c_max = b_min, b_max
+            rv_10d = calculate_rv(b_closes) # <--- ВОТ РАСЧЕТ РЕАЛИЗОВАННОЙ ВОЛАТИЛЬНОСТИ
+
+        # Расчет Премии за риск (Volatility Risk Premium)
+        vrp = current_dvol - rv_10d
 
         # 2. Высчитываем Edge (дистанции)
         low_dist_pct = ((final_spot - c_min) / final_spot * 100) if final_spot > 0 else 0
         high_dist_pct = ((c_max - final_spot) / final_spot * 100) if final_spot > 0 else 0
 
-        # 3. Собираем мультидень-текст по опционам (цепочка вокруг экспирации)
+        # 3. Собираем мультидень-текст по опционам
         try:
             idx = expiries_list.index(selected_exp)
             start_idx = max(0, idx - 2)
@@ -581,26 +595,25 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
         # 4. Формируем итоговый промпт
         prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
-Моя стратегия: Синтетический короткий стрэнгл на Polymarket состоящий из двух ног конструкции. Ставка на удержание цены в диапазоне (низкую волатильность и тета - на это идет расчет).
+Моя стратегия: Синтетический короткий стрэнгл на Polymarket (Ставка на удержание цены в диапазоне, расчет на низкую RV и сбор теты).
 
 [ИНСТРУКЦИЯ ПО РЫНКУ]
 1. Текущий Spot BTC: ${final_spot:,.0f}
-2. Текущий DVOL (Ожидаемая волатильность): {current_dvol:.1f}%
 
 [РЕАЛЬНЫЙ ДИАПАЗОН BTC ЗА 10 ДНЕЙ]
-- Минимум: ${c_min:,.0f}
-- Максимум: ${c_max:,.0f}
-
-[ПОЗИЦИЯ В ДИАПАЗОНЕ]
-- Дистанция до минимума: {low_dist_pct:.2f}%
-- Дистанция до максимума: {high_dist_pct:.2f}%
-
+- Минимум: ${c_min:,.0f} (Дистанция: {low_dist_pct:.2f}%)
+- Максимум: ${c_max:,.0f} (Дистанция: {high_dist_pct:.2f}%)
 ЗАДАЧА №0: Используй предоставленный диапазон (${c_min:,.0f} – ${c_max:,.0f}) как фактический. НЕ придумывай данные от себя.
 
+[ОЦЕНКА ВОЛАТИЛЬНОСТИ И ПРЕМИЯ ЗА РИСК (VRP)]
+- Ожидаемая волатильность рынка (IV / DVOL): {current_dvol:.1f}%
+- Фактическая (Реализованная) волатильность за 10 дней (RV): {rv_10d:.1f}%
+- Премия за риск (VRP = IV - RV): {vrp:+.1f}%
+
 [МОЯ СДЕЛКА НА POLYMARKET] (Дата экспирации: {selected_exp})
-- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Моя цена захода (YES): ${p_low_price:.2f}. BSM вероятность удержать: {prob_above_low*100:.1f}%
-- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Моя цена захода (NO): ${p_high_price:.2f}. BSM вероятность удержать: {prob_below_high*100:.1f}%
-- Общая BSM вероятность удержания ВНУТРИ коридора: {prob_inside*100:.1f}%
+- Нижний барьер: {int_to_k(p_low_strike)} (${p_low_strike:,.0f}). Моя цена захода (YES): ${p_low_price:.2f}. Себестоимость (BSM): {prob_above_low*100:.1f}%
+- Верхний барьер: {int_to_k(p_high_strike)} (${p_high_strike:,.0f}). Моя цена захода (NO): ${p_high_price:.2f}. Себестоимость (BSM): {prob_below_high*100:.1f}%
+- Общая математическая (BSM) вероятность удержания ВНУТРИ коридора: {prob_inside*100:.1f}%
 
 [ДАННЫЕ ПО ОПЦИОНАМ DERIBIT]
 {multi_day_text}
@@ -613,22 +626,21 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 1. **Вердикт ИИ**: ОДОБРЕНО / ПРОПУСК / ОПАСНО (и оценка 1-10). Кратко логику.
 
 2. **Анализ экстремумов**:
-Учитывая диапазон за 10 дней, находятся ли мои барьеры ${p_low_strike:,.0f} и ${p_high_strike:,.0f} ВНУТРИ этого диапазона или они защищены историческими экстремумами (ЗА пределами)? 
+Учитывая исторический 10d диапазон, находятся ли мои барьеры ${p_low_strike:,.0f} и ${p_high_strike:,.0f} ВНУТРИ этого диапазона или они защищены им (ЗА пределами)?
 
-3. **Цели (Max Pain)**: Как движется Max Pain к {selected_exp}? Есть ли риск, что цена будет притянута к нему и пробьет барьер?
+3. **Анализ RV vs IV (VRP)**: 
+Сравни RV ({rv_10d:.1f}%) и IV ({current_dvol:.1f}%). Рынок переоценивает риски или Биткоин реально летает слишком сильно (RV > IV)? Оправдывает ли VRP ({vrp:+.1f}%) продажу волатильности?
 
-4. **Макро-риск**: Есть ли в календаре события на этих датах, способные вызвать скачок волатильности?
+4. **Цели (Max Pain)**: Как движется Max Pain к {selected_exp}? Есть ли риск, что он притянет цену и пробьет барьер?
 
-5. **Финансовый Edge**: Оправдывает ли стоимость входа (${p_low_price + p_high_price:.2f}) математическую вероятность успеха?
+5. **Макро-риск**: Есть ли в календаре события на этих датах, способные вызвать скачок RV?
 
-6. **Наихудший сценарий**: С какой стороны (сверху или снизу) риск провала выше?
+6. **Финансовый Edge**: Оправдывает ли общая стоимость входа (${p_low_price + p_high_price:.2f}) математическую вероятность успеха?
 
-7. **Тайминг**: Конструкция закрывается за 24 часа до экспирации. Снижает ли это риск гамма-сквиза?
+7. **Наихудший сценарий**: С какой стороны (сверху или снизу) риск пробоя выше с учетом GEX и Дистанций до экстремумов?
 
-8. **Точка входа**: Открывать сейчас или ждать (например, изменения GEX или снижения DVOL)?
-
-9. **Риск-менеджмент**: Оцени адекватность стоп-лосса -10% от стоимости всей конструкции.
+8. **Риск-менеджмент**: Оцени адекватность стоп-лосса -10% от стоимости всей конструкции.
 """
 
-        st.success("✅ Промпт готов (данные успешно загружены через KuCoin/Kraken API)")
+        st.success("✅ Промпт готов (RV, IV и Премия за риск добавлены)")
         st.code(prompt_text, language="markdown")
