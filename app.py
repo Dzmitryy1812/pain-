@@ -483,36 +483,33 @@ st.divider()
 st.markdown("### 🤖 Генератор AI-Промпта")
 st.write("Сгенерировать готовый промпт с текущими переменными для ChatGPT или Claude.")
 
-# --- ФУНКЦИЯ ДИАПАЗОНА СТРОГО ЧЕРЕЗ BYBIT ---
-def get_btc_range_10d_bybit():
+def get_btc_range_10d():
+    """Сверхбыстрый парсер дневных свечей с Bybit без тяжелой панды"""
     url = "https://api.bybit.com/v5/market/kline"
     params = {
         "category": "spot",
         "symbol": "BTCUSDT",
-        "interval": "60", # 60 минут = 1 час
-        "limit": 240      # 240 часов = 10 дней
+        "interval": "D",  # Дневные свечи
+        "limit": 10       # Ровно за 10 дней
     }
     try:
-        r = requests.get(url, params=params, timeout=5)
+        r = requests.get(url, params=params, timeout=3)
         if r.status_code == 200:
             data = r.json().get("result", {}).get("list", [])
             if data and len(data) > 0:
-                # Bybit отдает: [startTime, open, high, low, close, volume, turnover]
-                # Свечи идут в обратном порядке (нулевой индекс = самая свежая)
-                df = pd.DataFrame(data, columns=["time", "open", "high", "low", "close", "vol", "turnover"])
+                # Bybit отдает массив [startTime, open, high, low, close, ...]
+                highs = [float(candle[2]) for candle in data]
+                lows = [float(candle[3]) for candle in data]
                 
-                df["high"] = df["high"].astype(float)
-                df["low"] = df["low"].astype(float)
-                df["close"] = df["close"].astype(float)
+                # Нулевой индекс [0] у Bybit - это текущий/последний день
+                last_price = float(data[0][4]) 
                 
-                min_p = df["low"].min()
-                max_p = df["high"].max()
-                last_p = df["close"].iloc[0] # Текущая цена
-                
-                return min_p, max_p, last_p
-        return None, None, None
+                return min(lows), max(highs), last_price
     except Exception as e:
-        return None, None, None
+        print(f"Ошибка Bybit: {e}")
+        pass
+        
+    return None, None, None
 
 def get_calendar_path(target_exp: str):
     try:
@@ -529,17 +526,20 @@ def get_calendar_path(target_exp: str):
     except:
         return "Не удалось рассчитать календарь"
 
-# Основная логика по кнопке
 if st.button("🧠 Сгенерировать Промпт", type="primary", use_container_width=True):
-    with st.spinner("Сбор исторических данных c Bybit и расчет метрик..."):
+    with st.spinner("Загрузка 10-дневной истории Bybit и расчет метрик..."):
         
-        # 1. Загружаем историю 10 дней
-        btc_min_10d, btc_max_10d, current_spot = get_btc_range_10d_bybit()
+        # 1. Загружаем историю 10 дней (дневные свечи)
+        b_min, b_max, b_spot = get_btc_range_10d()
         
-        # Защита от потенциальной ошибки (если нет связи, берем спот из начала кода)
-        final_spot = current_spot if current_spot else spot_price
-        c_min = btc_min_10d if btc_min_10d else final_spot
-        c_max = btc_max_10d if btc_max_10d else final_spot
+        # Защита: если Bybit все-таки не ответил
+        if b_min is None or b_max is None:
+            st.error("⚠️ Bybit отклонил запрос. Используются заглушки.")
+            final_spot = spot_price
+            c_min, c_max = spot_price, spot_price
+        else:
+            final_spot = b_spot
+            c_min, c_max = b_min, b_max
 
         # 2. Высчитываем Edge (дистанции)
         low_dist_pct = ((final_spot - c_min) / final_spot * 100) if final_spot > 0 else 0
@@ -567,7 +567,7 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
         calendar_path = get_calendar_path(selected_exp)
 
-        # 4. Формируем итоговый промпт со всеми 9 пунктами
+        # 4. Формируем итоговый промпт
         prompt_text = f"""Ты — квант-аналитик крипто-опционов и риск-менеджер маркетмейкера. 
 Моя стратегия: Синтетический короткий стрэнгл на Polymarket состоящий из двух ног конструкции. Ставка на удержание цены в диапазоне (низкую волатильность и тета - на это идет расчет).
 
@@ -615,8 +615,8 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 
 8. **Точка входа**: Открывать сейчас или ждать (например, изменения GEX или снижения DVOL)?
 
-9. стоп-лосс -10% от стоимости всей конструкции.
+9. **Риск-менеджмент**: Оцени адекватность стоп-лосса -10% от стоимости всей конструкции.
 """
 
-        st.success("✅ Промпт готов (исторические данные загружены с API Bybit)")
+        st.success("✅ Промпт готов (исторические данные загружены с API Bybit 1D)")
         st.code(prompt_text, language="markdown")
