@@ -306,10 +306,10 @@ with st.sidebar:
     st.divider()
     r_pct = st.slider("Ставка r (годовых, %)", 0.0, 20.0, 0.0, 0.25)
     r = r_pct / 100.0
-
-    user_iv = st.slider("IV вручную (%)", 10, 150, 60) / 100
+   
     zoom = st.slider("Масштаб графика (%)", 5, 50, 20)
 # --- 5. ОСНОВНОЙ ЭКРАН ---
+iv_used = current_dvol / 100.0
 st.title("⚡ BTC Alpha Terminal")
 
 if df_options.empty:
