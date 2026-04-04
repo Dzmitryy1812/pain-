@@ -137,7 +137,7 @@ def get_market_data():
         r = requests.get(
             "https://www.deribit.com/api/v2/public/get_volatility_index_data"
             "?currency=BTC&resolution=1",
-            timeout=5,
+            timeout=10,
         ).json()
         dvol = float(r["result"]["data"][-1][3])
     except Exception:
