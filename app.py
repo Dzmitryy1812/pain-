@@ -99,10 +99,11 @@ def int_to_k(x: int) -> str:
 
 # --- 3. ЗАГРУЗКА ДАННЫХ ---
 @st.cache_data(ttl=15)
+@st.cache_data(ttl=15)
 def get_market_data():
     price, source = 70_000.0, "Fallback"
 
-    # Bybit (primary)
+    # --- ЦЕНА (Bybit -> Binance -> Deribit) ---
     try:
         r = requests.get(
             "https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT",
@@ -111,7 +112,6 @@ def get_market_data():
         price = float(r["result"]["list"][0]["lastPrice"])
         source = "Bybit"
     except Exception:
-        # Binance (backup)
         try:
             r = requests.get(
                 "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
@@ -120,7 +120,6 @@ def get_market_data():
             price = float(r["price"])
             source = "Binance"
         except Exception:
-            # Deribit (last resort)
             try:
                 r = requests.get(
                     "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd",
@@ -131,20 +130,12 @@ def get_market_data():
             except Exception:
                 pass
 
-    # DVOL
-    dvol = 55.0
-    try:
-        r = requests.get(
-            "https://www.deribit.com/api/v2/public/get_volatility_index_data"
-            "?currency=BTC&resolution=1",
-            timeout=10,
-        ).json()
-        dvol = float(r["result"]["data"][-1][3])
-    except Exception:
-        pass
+    # --- DVOL (Теперь только база для слайдера) ---
+    # Мы больше не стучимся в API Deribit здесь, 
+    # так как ты управляешь этим значением вручную в Sidebar.
+    dvol = 55.0 
 
     return price, dvol, source
-
 @st.cache_data(ttl=300)
 def get_options_data() -> pd.DataFrame:
     try:
@@ -227,7 +218,14 @@ if "p_high_strike" not in st.session_state:
 with st.sidebar:
     st.markdown(f"### 💰 BTC: ${spot_price:,.1f}")
     st.caption(f"Источник: {price_source}")
-    st.caption(f"DVOL: {current_dvol:.1f}%")
+    current_dvol = st.slider(
+    "📊 Ручной DVOL (IV %)", 
+    min_value=10.0, 
+    max_value=150.0, 
+    value=float(current_dvol) if current_dvol > 0 else 55.0,
+    step=0.5,
+    help="Если API Deribit тормозит, выставь значение волатильности сам"
+)
 
     if st.button("🔄 Обновить данные рынка", use_container_width=True):
         st.cache_data.clear()
