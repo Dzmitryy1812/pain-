@@ -306,11 +306,10 @@ with st.sidebar:
         st.caption(f"Твой коридор: {p_low_strike:,}$ — {p_high_strike:,}$")
 
     st.divider()
-    use_atm_iv = st.toggle("IV: ATM mark_iv (Deribit)", value=True)
     r_pct = st.slider("Ставка r (годовых, %)", 0.0, 20.0, 0.0, 0.25)
     r = r_pct / 100.0
 
-    user_iv = st.slider("IV вручную (%)", 10, 150, int(current_dvol)) / 100
+    user_iv = st.slider("IV вручную (%)", 10, 150, 60) / 100
     zoom = st.slider("Масштаб графика (%)", 5, 50, 20)
 # --- 5. ОСНОВНОЙ ЭКРАН ---
 st.title("⚡ BTC Alpha Terminal")
@@ -335,12 +334,12 @@ if not df.empty:
 else:
     atm_iv = user_iv
 
-iv_used = atm_iv if use_atm_iv else user_iv
+iv_used = user_iv
 
 st.caption(
     f"IV used: {iv_used*100:.1f}%  |  ATM IV: {atm_iv*100:.1f}%  |  Manual IV: {user_iv*100:.1f}%  |  r: {r_pct:.2f}%"
 )
-effective_dvol = current_dvol if use_atm_iv else user_iv * 100
+effective_dvol = user_iv * 100
 # Время до экспирации (минимум 5 минут)
 T_years = max(
     (dt_exp - datetime.now(timezone.utc)).total_seconds(), 300
