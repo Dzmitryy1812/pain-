@@ -340,7 +340,7 @@ iv_used = atm_iv if use_atm_iv else user_iv
 st.caption(
     f"IV used: {iv_used*100:.1f}%  |  ATM IV: {atm_iv*100:.1f}%  |  Manual IV: {user_iv*100:.1f}%  |  r: {r_pct:.2f}%"
 )
-
+effective_dvol = current_dvol if use_atm_iv else user_iv * 100
 # Время до экспирации (минимум 5 минут)
 T_years = max(
     (dt_exp - datetime.now(timezone.utc)).total_seconds(), 300
@@ -612,7 +612,7 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
             rv_10d = calculate_rv(b_closes) # <--- ВОТ РАСЧЕТ РЕАЛИЗОВАННОЙ ВОЛАТИЛЬНОСТИ
 
         # Расчет Премии за риск (Volatility Risk Premium)
-        vrp = current_dvol - rv_10d
+        vrp = effective_dvol - rv_10d
 
         # 2. Высчитываем Edge (дистанции)
         low_dist_pct = ((final_spot - c_min) / final_spot * 100) if final_spot > 0 else 0
@@ -653,7 +653,7 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 ЗАДАЧА №0: Используй предоставленный диапазон (${c_min:,.0f} – ${c_max:,.0f}) как фактический. НЕ придумывай данные от себя.
 
 [ОЦЕНКА ВОЛАТИЛЬНОСТИ И ПРЕМИЯ ЗА РИСК (VRP)]
-- Ожидаемая волатильность рынка (IV / DVOL): {current_dvol:.1f}%
+- Ожидаемая волатильность рынка (IV / DVOL): {effective_dvol:.1f}%
 - Фактическая (Реализованная) волатильность за 7 дней (RV): {rv_10d:.1f}%
 - Премия за риск (VRP = IV - RV): {vrp:+.1f}%
 
