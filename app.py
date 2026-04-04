@@ -530,7 +530,7 @@ st.write("Сгенерировать готовый промпт с текущи
 
 # --- НОВАЯ ФУНКЦИЯ: РАСЧЕТ РЕАЛИЗОВАННОЙ ВОЛАТИЛЬНОСТИ (RV) ---
 def calculate_rv(closes):
-   if closes is None or len(closes) < 2:
+    if closes is None or len(closes) < 2:
         return 0.0
     # 1. Логарифмическая доходность: ln(P_t / P_{t-1})
     log_returns = np.log(np.array(closes[1:]) / np.array(closes[:-1]))
