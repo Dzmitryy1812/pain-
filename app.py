@@ -541,7 +541,7 @@ def calculate_rv(closes):
     
     return annualized_rv
 
-def get_btc_range_10d_bulletproof():
+def get_btc_range_7d_bulletproof():
     """Сверхнадежный парсер. Теперь возвращает также массив цен закрытия (closes)"""
     # 1. KuCoin
     try:
@@ -550,7 +550,7 @@ def get_btc_range_10d_bulletproof():
         if r.status_code == 200:
             res = r.json()
             if res.get("code") == "200000" and res.get("data"):
-                data = res["data"][:10] 
+                data = res["data"][:7] 
                 highs = [float(c[3]) for c in data]
                 lows = [float(c[4]) for c in data]
                 closes = [float(c[2]) for c in data]
@@ -569,7 +569,7 @@ def get_btc_range_10d_bulletproof():
             if not res.get("error"):
                 data = res.get("result", {}).get("XXBTZUSD", [])
                 if data:
-                    data = data[-10:]
+                    data = data[-7:]
                     highs = [float(c[2]) for c in data]
                     lows = [float(c[3]) for c in data]
                     closes = [float(c[4]) for c in data] # Kraken отдает хронологично
@@ -598,7 +598,7 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
     with st.spinner("Загрузка истории, расчет RV и метрик..."):
         
         # 1. Загружаем историю 10 дней + массив closes
-        b_min, b_max, b_spot, b_closes = get_btc_range_10d_bulletproof()
+        b_min, b_max, b_spot, b_closes = get_btc_range_7d_bulletproof()
         
         # Защита графиков
         if b_min is None or b_max is None:
@@ -647,14 +647,14 @@ if st.button("🧠 Сгенерировать Промпт", type="primary", use
 [ИНСТРУКЦИЯ ПО РЫНКУ]
 1. Текущий Spot BTC: ${final_spot:,.0f}
 
-[РЕАЛЬНЫЙ ДИАПАЗОН BTC ЗА 10 ДНЕЙ]
+[РЕАЛЬНЫЙ ДИАПАЗОН BTC ЗА 7 ДНЕЙ]
 - Минимум: ${c_min:,.0f} (Дистанция: {low_dist_pct:.2f}%)
 - Максимум: ${c_max:,.0f} (Дистанция: {high_dist_pct:.2f}%)
 ЗАДАЧА №0: Используй предоставленный диапазон (${c_min:,.0f} – ${c_max:,.0f}) как фактический. НЕ придумывай данные от себя.
 
 [ОЦЕНКА ВОЛАТИЛЬНОСТИ И ПРЕМИЯ ЗА РИСК (VRP)]
 - Ожидаемая волатильность рынка (IV / DVOL): {current_dvol:.1f}%
-- Фактическая (Реализованная) волатильность за 10 дней (RV): {rv_10d:.1f}%
+- Фактическая (Реализованная) волатильность за 7 дней (RV): {rv_10d:.1f}%
 - Премия за риск (VRP = IV - RV): {vrp:+.1f}%
 
 [МОЯ СДЕЛКА НА POLYMARKET] (Дата экспирации: {selected_exp})
