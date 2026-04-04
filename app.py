@@ -7,6 +7,26 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone, timedelta
 from scipy.stats import norm
 
+# --- МАТЕМАТИЧЕСКИЙ ЯДРО (ОБЯЗАТЕЛЬНО) ---
+
+def lognormal_prob_above(S: float, K: float, iv: float, T: float, r: float = 0.0) -> float:
+    """P(S_T > K) — риск-нейтральная вероятность (формула N(d2) из BSM)."""
+    if S <= 0 or K <= 0 or iv <= 0 or T <= 0:
+        return 0.5 # Возвращаем 50%, если данные некорректны
+    d2 = (math.log(S / K) + (r - 0.5 * iv**2) * T) / (iv * math.sqrt(T))
+    return float(norm.cdf(d2))
+
+def lognormal_prob_below(S: float, K: float, iv: float, T: float, r: float = 0.0) -> float:
+    """P(S_T < K)."""
+    return 1.0 - lognormal_prob_above(S, K, iv, T, r=r)
+
+def calc_gamma(S: float, K: float, iv: float, T: float, r: float = 0.0) -> float:
+    """BSM Gamma."""
+    if S <= 0 or K <= 0 or iv <= 0 or T <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+    return float(norm.pdf(d1) / (S * iv * np.sqrt(T)))
+    
 def parse_expiry(exp_str: str) -> datetime:
     """Парсит строку даты (напр. 28MAR25) в объект datetime."""
     for fmt in ("%d%b%y", "%d%b%Y"):
