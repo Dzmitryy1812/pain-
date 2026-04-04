@@ -310,6 +310,7 @@ with st.sidebar:
     zoom = st.slider("Масштаб графика (%)", 5, 50, 20)
 # --- 5. ОСНОВНОЙ ЭКРАН ---
 iv_used = current_dvol / 100.0
+iv_used = user_iv 
 st.title("⚡ BTC Alpha Terminal")
 
 if df_options.empty:
