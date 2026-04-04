@@ -309,8 +309,9 @@ with st.sidebar:
    
     zoom = st.slider("Масштаб графика (%)", 5, 50, 20)
 # --- 5. ОСНОВНОЙ ЭКРАН ---
-iv_used = current_dvol / 100.0
-iv_used = user_iv 
+user_iv = current_dvol / 100.0  # Явно инициализируем
+iv_used = user_iv
+
 st.title("⚡ BTC Alpha Terminal")
 
 if df_options.empty:
@@ -333,12 +334,12 @@ if not df.empty:
 else:
     atm_iv = user_iv
 
-iv_used = user_iv
-
 st.caption(
     f"IV used: {iv_used*100:.1f}%  |  ATM IV: {atm_iv*100:.1f}%  |  Manual IV: {user_iv*100:.1f}%  |  r: {r_pct:.2f}%"
 )
+
 effective_dvol = user_iv * 100
+
 # Время до экспирации (минимум 5 минут)
 T_years = max(
     (dt_exp - datetime.now(timezone.utc)).total_seconds(), 300
