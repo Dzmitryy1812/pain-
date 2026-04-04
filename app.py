@@ -16,31 +16,108 @@ if "p_high_price" not in st.session_state:
 st.set_page_config(page_title="BTC Alpha Terminal", page_icon="⚡", layout="wide")
 
 # --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def get_bbw_data(symbol="BTCUSDT", interval="1d", length=20, mult=2.0, hl_ref=125):
-    # Загружаем историю (например, через KuCoin или Kraken)
-    # Для расчета hl_ref нам нужно минимум length + hl_ref свечей
-    url = f"https://api.kucoin.com/api/v1/market/candles?symbol={symbol.replace('USDT', '-USDT')}&type={interval}"
+def get_bbw_data(symbol="BTCUSDT", interval="1day", length=20, mult=2.0, hl_ref=125):
+    """
+    Расчёт Bollinger Band Width с защитой от ошибок
+    """
+    # Конвертируем interval: 1d -> 1day для KuCoin
+    interval_map = {
+        "1d": "1day",
+        "1h": "1hour",
+        "4h": "4hour",
+        "1w": "1week"
+    }
+    kucoin_interval = interval_map.get(interval, interval)
+    
+    # Формируем URL
+    kucoin_symbol = symbol.replace("USDT", "-USDT")
+    url = f"https://api.kucoin.com/api/v1/market/candles?symbol={kucoin_symbol}&type={kucoin_interval}"
+    
     try:
-        r = requests.get(url, timeout=5).json()
-        data = r["data"] # [time, open, close, high, low, volume, amount]
-        df_hist = pd.DataFrame(data, columns=['t','o','c','h','l','v','a']).astype(float)
-        df_hist = df_hist.iloc[::-1].reset_index(drop=True) # Хронологический порядок
+        # Запрос с таймаутом
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()  # Выбросит ошибку если статус != 200
         
-        # Расчет BBW
-        sma = df_hist['c'].rolling(window=length).mean()
-        std = df_hist['c'].rolling(window=length).std()
+        data = r.json()
+        
+        # Проверяем структуру ответа
+        if data.get("code") != "200000":
+            st.warning(f"⚠️ KuCoin API error: {data.get('msg', 'Unknown')}")
+            return 0.0, 0.0, 0.0
+        
+        candles = data.get("data", [])
+        
+        if not candles:
+            st.warning("⚠️ KuCoin вернул пустой массив свечей")
+            return 0.0, 0.0, 0.0
+        
+        # Минимум данных для расчёта
+        min_required = length + hl_ref
+        if len(candles) < min_required:
+            st.warning(f"⚠️ Недостаточно данных: {len(candles)} свечей (нужно {min_required})")
+            # Попробуем с тем что есть
+        
+        # Парсим данные [time, open, close, high, low, volume, turnover]
+        df_hist = pd.DataFrame(
+            candles, 
+            columns=['timestamp', 'open', 'close', 'high', 'low', 'volume', 'turnover']
+        )
+        
+        # Конвертируем в float
+        for col in ['open', 'close', 'high', 'low', 'volume']:
+            df_hist[col] = pd.to_numeric(df_hist[col], errors='coerce')
+        
+        # KuCoin отдаёт от новых к старым → переворачиваем
+        df_hist = df_hist.iloc[::-1].reset_index(drop=True)
+        
+        # Проверяем наличие NaN
+        if df_hist['close'].isna().any():
+            st.warning("⚠️ В данных есть пропуски (NaN)")
+            df_hist = df_hist.dropna(subset=['close'])
+        
+        if len(df_hist) < length:
+            st.warning(f"⚠️ После очистки осталось {len(df_hist)} свечей (нужно минимум {length})")
+            return 0.0, 0.0, 0.0
+        
+        # --- Расчёт BBW ---
+        sma = df_hist['close'].rolling(window=length).mean()
+        std = df_hist['close'].rolling(window=length).std()
         
         upper = sma + (std * mult)
         lower = sma - (std * mult)
         
+        # BBW = (Upper - Lower) / SMA
         df_hist['bbw'] = (upper - lower) / sma
         
         # Референсные значения (High/Low за период)
         df_hist['hx'] = df_hist['bbw'].rolling(window=hl_ref).max()
         df_hist['lx'] = df_hist['bbw'].rolling(window=hl_ref).min()
         
-        return df_hist.iloc[-1]['bbw'], df_hist.iloc[-1]['hx'], df_hist.iloc[-1]['lx']
-    except:
+        # Берём последнее значение (самое свежее)
+        last_row = df_hist.iloc[-1]
+        
+        curr_bbw = last_row['bbw']
+        bbw_high = last_row['hx']
+        bbw_low = last_row['lx']
+        
+        # Проверяем на NaN в результате
+        if pd.isna(curr_bbw) or pd.isna(bbw_high) or pd.isna(bbw_low):
+            st.warning("⚠️ BBW расчёт вернул NaN (недостаточно истории)")
+            return 0.0, 0.0, 0.0
+        
+        return float(curr_bbw), float(bbw_high), float(bbw_low)
+        
+    except requests.exceptions.Timeout:
+        st.error("❌ KuCoin API timeout (>10 сек)")
+        return 0.0, 0.0, 0.0
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Ошибка запроса к KuCoin: {str(e)}")
+        return 0.0, 0.0, 0.0
+    except KeyError as e:
+        st.error(f"❌ Неожиданная структура данных KuCoin: {str(e)}")
+        return 0.0, 0.0, 0.0
+    except Exception as e:
+        st.error(f"❌ Неизвестная ошибка в get_bbw_data: {str(e)}")
         return 0.0, 0.0, 0.0
 
 def parse_expiry(exp_str: str) -> datetime:
