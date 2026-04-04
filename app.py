@@ -357,6 +357,8 @@ c1, c2, c3 = st.columns(3)
 c1.metric("P(выше low)",  f"{prob_above_low*100:.1f}%")
 c2.metric("P(ниже high)", f"{prob_below_high*100:.1f}%")
 c3.metric("P(в диапазоне)", f"{prob_inside*100:.1f}%")
+st.divider()
+st.markdown("### 🤖 Генератор AI-Промпта")
 st.subheader("📊 Индикаторы волатильности (BBW)")
 curr_bbw, bbw_high, bbw_low = get_bbw_data(hl_ref=125)
 
@@ -528,7 +530,7 @@ st.write("Сгенерировать готовый промпт с текущи
 
 # --- НОВАЯ ФУНКЦИЯ: РАСЧЕТ РЕАЛИЗОВАННОЙ ВОЛАТИЛЬНОСТИ (RV) ---
 def calculate_rv(closes):
-    if not closes or len(closes) < 2: 
+   if closes is None or len(closes) < 2:
         return 0.0
     # 1. Логарифмическая доходность: ln(P_t / P_{t-1})
     log_returns = np.log(np.array(closes[1:]) / np.array(closes[:-1]))
