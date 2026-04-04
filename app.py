@@ -7,6 +7,18 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone, timedelta
 from scipy.stats import norm
 
+def parse_expiry(exp_str: str) -> datetime:
+    """Парсит строку даты (напр. 28MAR25) в объект datetime."""
+    for fmt in ("%d%b%y", "%d%b%Y"):
+        try:
+            return (
+                datetime.strptime(exp_str, fmt).replace(tzinfo=timezone.utc)
+                + timedelta(hours=8)
+            )
+        except ValueError:
+            continue
+    raise ValueError(f"Неизвестный формат даты: {exp_str}")
+    
 if "p_low_price" not in st.session_state:
     st.session_state.p_low_price = 0.5
 if "p_high_price" not in st.session_state:
