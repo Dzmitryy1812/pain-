@@ -300,7 +300,7 @@ with st.sidebar:
 user_iv = current_dvol / 100.0  # Явно инициализируем
 iv_used = user_iv
 
-st.title("⚡ BTC Alpha Terminal")
+st.title("⚡Terminal")
 
 if df_options.empty:
     st.error("Не удалось загрузить книгу опционов Deribit.")
