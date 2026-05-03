@@ -212,7 +212,7 @@ with st.sidebar:
     # Ссылка на Polymarket теперь тоже в сайдбаре!
     poly_url = st.text_input(
         "Ссылка на событие (Polymarket):", 
-        value="https://polymarket.com/event/bitcoin-above-on-april-1",
+        value="https://polymarket.com/event/bitcoin-above-on-may-1",
         help="Вставь ссылку на страницу события, чтобы кнопки 🔄 могли подтянуть цены"
     )
     
